@@ -1,6 +1,6 @@
 data:
   id: "HuggingFaceFW/fineweb-edu"
-  tokenizer: "meta-llama/Llama-2-7b"
+  tokenizer: "kathir67/Llama-2-7b"
   cache_dir: "gs://indic-llama-data/cache/"
 
 model:
