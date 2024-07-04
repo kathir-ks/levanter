@@ -29,7 +29,7 @@ from levanter.models.attention import AttentionBackend, AttentionMask, dot_produ
 from levanter.models.gpt2 import ACT2FN
 from levanter.models.lm_model import LmConfig, LmHeadModel
 from levanter.types import BlockFoldable
-from levanter.utils.py_utils import cached_classproperty
+from levanter.utils.flop_utils import lm_flops_per_token
 
 
 silence_transformer_nag()
@@ -78,6 +78,10 @@ class LlamaConfig(HFCompatConfig):
     use_bias: bool = False
     use_layer_norm_weight: bool = True
     rope_scaling: Optional[dict] = None
+    rope_theta: float = 10000.0
+
+    reference_checkpoint: str = "meta-llama/Llama-2-7b-hf"
+    tokenizer: Optional[str] = None
 
     # Axis
     Pos = property(lambda self: Axis(name="position", size=self.seq_len))
@@ -94,13 +98,12 @@ class LlamaConfig(HFCompatConfig):
             self.num_heads % self.num_kv_heads == 0
         ), f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
 
-    @cached_classproperty
-    def default_hf_checkpoint_converter(cls) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
+    def hf_checkpoint_converter(self) -> HFCheckpointConverter["LlamaConfig"]:  # type: ignore
         return HFCheckpointConverter(
-            cls,  # type: ignore
-            "meta-llama/Llama-2-7b-hf",
+            self.__class__,
+            reference_checkpoint=self.reference_checkpoint,
             trust_remote_code=True,
-            tokenizer="hf-internal-testing/llama-tokenizer",
+            tokenizer=self.tokenizer if self.tokenizer else self.reference_checkpoint,
             HfConfigClass=HfLlamaConfig,
         )
 
@@ -117,6 +120,7 @@ class LlamaConfig(HFCompatConfig):
             initializer_range=hf_config.initializer_range,
             layer_norm_epsilon=hf_config.rms_norm_eps,
             rope_scaling=hf_config.rope_scaling,
+            rope_theta=hf_config.rope_theta,
         )
 
     def to_hf_config(self, vocab_size: int, config_overrides: Optional[Dict] = None) -> HfLlamaConfig:
@@ -144,16 +148,29 @@ class LlamaConfig(HFCompatConfig):
             rms_norm_eps=self.layer_norm_epsilon,
             rope_scaling=self.rope_scaling,
             vocab_size=vocab_size,
+            rope_theta=self.rope_theta,
             **config_overrides,
         )
 
     @property
-    def model_type(cls) -> Type["LlamaLMHeadModel"]:
+    def model_type(self) -> Type["LlamaLMHeadModel"]:
         return LlamaLMHeadModel
 
     def mk_LayerNorm(self, axis: Axis) -> "LlamaRMSNorm":
         return LlamaRMSNorm.init(
             axis, eps=self.layer_norm_epsilon, use_weight=self.use_layer_norm_weight, use_bias=self.use_bias
+        )
+
+    def flops_per_token(self, vocab_size: int):
+        return lm_flops_per_token(
+            hidden_dim=self.hidden_dim,
+            intermediate_dim=self.intermediate_dim,
+            num_layers=self.num_layers,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            seq_len=self.seq_len,
+            vocab_size=vocab_size,
+            glu=True,
         )
 
 
@@ -257,6 +274,13 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         )
         return LlamaAttention(config, q_proj, k_proj, v_proj, o_proj)
 
+    def _rope_scale_factor(self) -> float:
+        # hasattr for gemma and I'm feeling lazy
+        if hasattr(self.config, "rope_scaling") and self.config.rope_scaling is not None:
+            assert self.config.rope_scaling["type"] == "linear"
+            return self.config.rope_scaling["factor"]
+        return 1.0
+
     @named_call
     def __call__(self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None) -> NamedArray:
         key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
@@ -266,7 +290,12 @@ class LlamaAttention(StateDictSerializationMixin, eqx.Module):
         k = self.k_proj(x, key=key_k).rearrange((..., "kv_heads", "position", "head_size"))
         v = self.v_proj(x, key=key_v).rearrange((..., "kv_heads", "position", "head_size"))
 
-        cos, sin = llama_rotary_pos_emb(self.config.HeadSize, x.resolve_axis("position"))
+        cos, sin = llama_rotary_pos_emb(
+            self.config.HeadSize,
+            x.resolve_axis("position"),
+            scale=self._rope_scale_factor(),
+            theta=self.config.rope_theta,
+        )
         q, k = _apply_rotary_pos_emb(q, k, cos, sin)
 
         k = k.rename({"position": "key_position"})
@@ -445,6 +474,8 @@ class LlamaTransformer(StateDictSerializationMixin, eqx.Module):
         if isinstance(self.layers, Stacked):
             stacked_dict = unstack_state_dict(my_state_dict, prefix=apply_prefix(prefix, "layers"))
             state_dict.update(stacked_dict)
+        else:
+            state_dict.update(my_state_dict)
 
         return state_dict
 
@@ -472,7 +503,7 @@ class LlamaEmbedding(StateDictSerializationMixin, eqx.Module):
         return self.token_embeddings.unembed(x)
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        return {"token_embeddings": "model.embed_tokens.weight"}
+        return {"token_embeddings": "model.embed_tokens"}
 
     def resize_embeddings(self, new_size: int, key: Optional[PRNGKeyArray] = None):
         new_weights = self.token_embeddings.resize_embeddings(new_size, key=key)
@@ -580,12 +611,14 @@ def _apply_rotary_pos_emb(
     return q_embed, k_embed
 
 
-def llama_rotary_pos_emb(HeadSize: Axis, Pos: Axis, base: int = 10000) -> Tuple[NamedArray, NamedArray]:
+def llama_rotary_pos_emb(
+    HeadSize: Axis, Pos: Axis, theta: float = 10000, scale: float = 1.0
+) -> Tuple[NamedArray, NamedArray]:
     with jax.ensure_compile_time_eval():
         HeadHalfSize = HeadSize.resize(HeadSize.size // 2)
-        inv_freq: NamedArray = 1.0 / (base ** (hax.arange(HeadHalfSize, step=2) / HeadSize.size))
+        inv_freq: NamedArray = 1.0 / (theta ** (hax.arange(HeadHalfSize, step=2) / HeadSize.size))
 
-        position_ids: NamedArray = hax.arange(Pos)
+        position_ids: NamedArray = hax.arange(Pos) / scale
 
         freqs = position_ids * inv_freq.broadcast_axis(Pos)
         # This is different from the paper but aligns with HF implementation:
