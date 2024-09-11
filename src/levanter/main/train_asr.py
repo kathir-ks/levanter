@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
+import jax
 import jax.random as jrandom
 
 import haliax as hax
@@ -14,7 +15,7 @@ import levanter
 from levanter import callbacks
 from levanter.compat.hf_checkpoints import HFCompatConfig, ModelWithHfSerializationMixin, save_hf_checkpoint_callback
 from levanter.data.audio import AudioIODatasetConfig, AudioTextDataset
-from levanter.models.asr_model import ASRConfig
+from levanter.models.asr_model import ASRConfig, AudioTextExample
 from levanter.models.whisper import WhisperConfig
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
@@ -81,11 +82,21 @@ def main(config: TrainASRConfig):
     levanter.initialize(config)
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
+    def compute_loss(
+        m,
+        example: AudioTextExample,
+        *,
+        key=None,
+        reduction: Optional[hax.ReductionFunction] = hax.mean,
+        reduction_axis: Optional[hax.AxisSelection] = None,
+    ) -> jax.numpy.ndarray | hax.NamedArray:
+        return m.compute_loss(example, key=key, reduction=reduction, reduction_axis=reduction_axis)
+
     # Using the trainer as a context manager does 3 things:
     # 1. Sets the device mesh
     # 2. Sets the axis mapping (for fsdp)
     # 3. Sets the global metrics tracker
-    with Trainer(config.trainer, optimizer) as trainer:
+    with Trainer(config.trainer, optimizer, compute_loss) as trainer:  # type: ignore
         # randomness in jax is tightly controlled by "keys" which are the states of the random number generators
         # this makes deterministic training pretty easy
         seed = config.trainer.seed
@@ -102,7 +113,7 @@ def main(config: TrainASRConfig):
         Pos = config.model.Pos
         KeyPos = config.model.KeyPos
 
-        eval_datasets = config.data.validation_sets(config.batch_size)
+        eval_datasets = config.data.validation_sets()
         train_dataset = AudioTextDataset(
             config.data.train_set(config.batch_size),
             Pos,
@@ -133,9 +144,7 @@ def main(config: TrainASRConfig):
                 # this is a bit gross, but we want to free up the memory from the model we just built
                 state = dataclasses.replace(state, model=None)
                 assert isinstance(config.model.asr_model_type, ModelWithHfSerializationMixin)
-                model = converter.load_pretrained(  # type: ignore
-                    config.model.asr_model_type, config.model, axis_mapping=parameter_axis_mapping
-                )
+                model = converter.load_pretrained(config.model.asr_model_type, axis_mapping=parameter_axis_mapping)
                 model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
                 state = dataclasses.replace(state, model=model)
             else:
@@ -180,16 +189,7 @@ def main(config: TrainASRConfig):
             logprobs = hax.roll(logprobs, 1, Pos)
             return logprobs.rearrange((EvalBatch, Pos)).array
 
-        # data loader. may need to seek to the right place if we're resuming
-        train_loader = iter(trainer.sharded_loader(train_dataset, Batch))
-
-        if int(state.step) > 0:
-            # step is after the batch, so we need to seek to step
-            # TODO: implement iter_data.seek(resume_step +1)
-            import tqdm
-
-            for _ in tqdm.tqdm(range(state.step), desc="seeking data for resume"):
-                next(train_loader)
+        train_loader = trainer.data_loader(train_dataset, Batch).iter_from_step(state.step)
 
         ## OK, actually run training!
         trainer.train(state, train_loader)

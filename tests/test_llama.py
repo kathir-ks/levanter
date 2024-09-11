@@ -47,11 +47,12 @@ def test_llama_config():
 
 def test_llama_flops():
     # Check that the forward flops is within 10% of the naive calculation
-    hf_config = transformers.LlamaConfig.from_pretrained("huggyllama/llama-7b")
+    hf_config = transformers.LlamaConfig.from_pretrained("NousResearch/Llama-2-7b-hf")
     llama_config = LlamaConfig.from_hf_config(hf_config)
-    n_params = 6.7e9
-    ratio = 2 * n_params / llama_config.flops_per_token(hf_config.vocab_size)
-    assert ratio > 0.85, f"ratio {ratio} < 0.9"
+    n_params = 6.738415616e9
+    ratio = llama_config.flops_per_token(hf_config.vocab_size) / (2 * n_params)
+    assert ratio > 1.1, f"ratio {ratio} < 1.1"
+    assert ratio < 1.2, f"ratio {ratio} > 1.2"
 
 
 @skip_if_no_torch
@@ -295,7 +296,7 @@ def test_llama_roundtrip(scan_layers, num_kv_heads):
         torch_model.save_pretrained(f"{tmpdir}/torch_model")
 
         model = converter.load_pretrained(
-            LlamaLMHeadModel, config, f"{tmpdir}/torch_model", resize_vocab_to_match_tokenizer=False
+            LlamaLMHeadModel, ref=f"{tmpdir}/torch_model", resize_vocab_to_match_tokenizer=False
         )
 
         @hax.named_jit
@@ -384,6 +385,4 @@ def test_state_dict_consistency(scan_layers, num_kv_heads):
     model = LlamaLMHeadModel.init(Vocab=Vocab, config=config, key=random.PRNGKey(0))
     hf_config = config.to_hf_config(Vocab.size)
     hf_model = LlamaForCausalLM(hf_config)
-    print(hf_model.state_dict().keys())
-    print(model.to_state_dict().keys())
     assert set(hf_model.state_dict().keys()) == set(model.to_state_dict().keys())
