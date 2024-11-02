@@ -1,4 +1,4 @@
-data: !include data/fineweb_llama_txt.yaml
+data: !include data/redpajama_1b_source.yaml
 model:  # 1B class model
   type: llama
   seq_len: 2048
@@ -12,11 +12,11 @@ model:  # 1B class model
 trainer:
   tracker:
     type: wandb
-    project: "marin"
+    project: "indic-llama"
     tags: ["fineweb", "llama"]
 
   mp: p=f32,c=bfloat16
-  train_batch_size: 1024
+  train_batch_size: 2048
   num_train_steps: 750000  # 3,000,000,000,000 / 4,000,000 = 750,000
   steps_per_eval: 1000
   tensor_parallel_axes: ["mlp", "heads"]
