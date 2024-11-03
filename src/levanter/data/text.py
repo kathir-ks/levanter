@@ -8,12 +8,10 @@ import os
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
-from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
 
-import braceexpand
 import datasets
 import equinox as eqx
-import fsspec
 import jax
 import numpy as np
 import regex
@@ -34,9 +32,10 @@ from levanter.data.mixture import MixtureDataset, StopStrategy
 from levanter.logging import silence_transformer_nag  # noqa
 from levanter.models.attention import AttentionMask
 from levanter.models.lm_model import LmExample
-from levanter.store.cache import TreeCache
+from levanter.store.cache import CacheOptions, TreeCache
 from levanter.store.jagged_array import JaggedArrayStore
 from levanter.store.tree_store import TreeStore
+from levanter.utils.fsspec_utils import fsspec_expand_glob
 from levanter.utils.hf_utils import num_cpus_used_by_tokenizer
 
 
@@ -112,23 +111,6 @@ class TokenSeqDataset(AsyncDataset[np.ndarray]):
                 out.append(token_arrays.data[offset : offset + self.seq_len].read())
 
         out = await asyncio.gather(*out)
-        return out
-
-    def get_batch_sync(self, indices: Sequence[int]) -> Sequence[T_co]:
-        token_arrays = self.doc_cache.store.tree["input_ids"]
-        # logger.info(f"Time to get token cache: {time.time() - time_in}")
-        # len = await self.wait_until_len_at_least(max(indices) + 1)
-        # if len is not None and len < max(indices) + 1:
-        # raise ValueError("Requested indices beyond the end of the dataset")
-        offsets = np.array(indices) * self.seq_len
-        with ts.Batch():
-            out = []
-            for offset in offsets:
-                out.append(token_arrays.data[offset : offset + self.seq_len].read())
-        # logger.info(f"Time to read token cache: {time.time() - time_in}")
-
-        out = [x.result() for x in out]
-        # logger.info(f"Time to wait for token cache: {time.time() - time_in}")
         return out
 
     async def wait_until_len_at_least(self, length: int) -> int:
@@ -213,7 +195,6 @@ class BatchTokenizer(BatchProcessor[str, dict]):
         enforce_bos=True,
         enforce_eos=True,
         *,
-        batch_size=128,
         override_resources=None,
         _workaround_len=LONG_STRING_WORKAROUND,
         return_attention_mask=False,
@@ -246,8 +227,6 @@ class BatchTokenizer(BatchProcessor[str, dict]):
         else:
             should_append_eos = False
             should_append_bos = False
-
-        self._batch_size = batch_size
 
         self._need_to_add_eos = should_append_eos
         self._need_to_add_bos = should_append_bos
@@ -305,6 +284,18 @@ class BatchTokenizer(BatchProcessor[str, dict]):
 
             batch.append(d)
         return batch, needs_merge
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "tokenizer": self.tokenizer.name_or_path,
+            "vocab_size": len(self.tokenizer),
+            "return_attention_mask": self.return_attention_mask,
+            "padding": self.padding,
+            "max_length": self.max_length,
+            "append_bos": self._need_to_add_bos,
+            "append_eos": self._need_to_add_eos,
+        }
 
     @property
     def output_exemplar(self) -> dict:
@@ -384,10 +375,6 @@ class BatchTokenizer(BatchProcessor[str, dict]):
         if self.override_resources is not None:
             return self.override_resources.get("num_gpus", 0)
         return 0
-
-    @property
-    def batch_size(self) -> int:
-        return self._batch_size
 
 
 def concatenate_and_group_texts(
@@ -478,6 +465,7 @@ class LMDatasetSourceConfig:
 
     train_urls: List[str] = ()  # type: ignore
     validation_urls: List[str] = ()  # type:ignore
+    cache_dir: Optional[str] = None  # Optionally override the cache dir for this component
 
     def get_shard_source(self, split) -> Optional[ShardedDataSource[str]]:
         if self.id is not None:
@@ -520,19 +508,7 @@ class LMDatasetSourceConfig:
         else:
             raise ValueError(f"Unknown split {split}")
 
-        def fsspec_expand_glob(url):
-            if "*" in url:
-                fs = fsspec.core.url_to_fs(url)[0]
-                globbed = fs.glob(url)
-                # have to append the fs prefix back on
-                protocol, _ = fsspec.core.split_protocol(url)
-                if protocol is None:
-                    return globbed
-                return [f"{protocol}://{path}" for path in globbed]
-            else:
-                return [url]
-
-        urls = [globbed for pat in urls for url in braceexpand.braceexpand(pat) for globbed in fsspec_expand_glob(url)]
+        urls = [globbed for url in urls for globbed in fsspec_expand_glob(url)]
         return urls
 
 
@@ -542,8 +518,8 @@ class LMTaskConfig(abc.ABC):
     vocab_size: Optional[int] = None  # if using the passthrough tokenizer, this is required
 
     # config related to caching
-    cache_dir: str = "cache/"
-    tokenizer_batch_size: int = 32
+    cache_dir: Optional[str] = "cache/"
+    cache_options: CacheOptions = field(default_factory=CacheOptions)
     enforce_eos: bool = True  # whether to append eos even if the tokenizer doesn't
 
     ignore_token_id: Optional[int] = None
@@ -572,7 +548,7 @@ class LMTaskConfig(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def sources(self) -> dict[str, LMDatasetSourceConfig]:
+    def sources(self) -> Mapping[str, LMDatasetSourceConfig]:
         pass
 
     def tagged_eval_sets(
@@ -585,8 +561,91 @@ class LMTaskConfig(abc.ABC):
 
 
 @dataclass
+class LMSupervisedDatasetConfig:
+    """This class represents a dataset source with URLs or hf name/id."""
+
+    cache_dir: str = "cache/"
+
+    tags: Optional[List[str]] = None
+    """tags for the dataset. Typically the name of the dataset in the config will be added as a tag as well"""
+    name: Optional[str] = None  # name for hf dataset
+
+    input_field: str = "prompt"  # name of the input field in the jsonl file
+    output_field: str = "response"  # name of the output field in the jsonl file
+
+    validation_urls: List[str] = ()  # type:ignore
+
+
+def preprocess_supervised_example(
+    batch, tokenizer: PreTrainedTokenizerBase, input_field: str, output_field: str
+) -> dict:
+    sources = [example[input_field] for example in batch]
+
+    targets = [example[output_field] for example in batch]
+    # TODO: this seems pretty wasteful since you end up tokenizing twice, but it's how alpaca does it.
+    examples = [s + t for s, t in zip(sources, targets)]
+    sources_tokenized = tokenizer(sources, padding=False, truncation=True)
+    examples_tokenized = tokenizer(examples, padding=False, truncation=True)
+
+    source_lens = [len(s) for s in sources_tokenized["input_ids"]]
+
+    return {
+        "input_ids": [np.array(example, dtype=np.int32) for example in examples_tokenized["input_ids"]],
+        "sources_len": np.array(source_lens, dtype=np.int32),
+    }
+
+
+def _prepare_supervised_example(ex: dict, tokenizer: PreTrainedTokenizerBase) -> LmExample:
+    """
+    Prepare an example for training. This function converts the (cached) batch encoding into an LmExample.
+
+    It goes through the following steps:
+
+    1. Pad the batch to the maximum length.
+    2. Mask out the input and prompt if requested.
+    3. Create an LmExample with the input_ids as the input and the next token as the target.
+    """
+    with local_cpu_mesh():
+        # annoyingly, pad expects things to be batched so we have to prepend a batch axis
+        ex = tokenizer.pad({k: np.expand_dims(v, 0) for k, v in ex.items()}, return_tensors="np", padding="max_length")
+        ex = {k: v[0] for k, v in ex.items()}
+        input_ids = hax.named(ex["input_ids"], "position")
+        # mask out padding and anything before the start of the target
+        Pos = input_ids.resolve_axis("position")
+        loss_mask = hax.arange(Pos) >= ex["sources_len"] - 1
+
+        # don't predict the padding
+        targets = hax.roll(input_ids, -1, Pos)
+        loss_mask = loss_mask & (targets != tokenizer.pad_token_id)
+        loss_mask = loss_mask & (1 - hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_))
+        lm_ex = LmExample.causal(input_ids, loss_mask=loss_mask)
+        return lm_ex
+
+
+def mk_supervised_dataset(config: LMSupervisedDatasetConfig, tokenizer: PreTrainedTokenizerBase):
+    import levanter.data
+
+    validation_urls = [url for url_pat in config.validation_urls for url in fsspec_expand_glob(url_pat)]
+    dataset = levanter.data.datasource_from_jsonl(validation_urls)
+
+    input_field = config.input_field
+    output_field = config.output_field
+
+    output_exemplar = {"input_ids": np.zeros((0,), dtype=np.int32), "sources_len": np.zeros((), dtype=np.int32)}
+
+    dataset = dataset.map_batches(lambda ex: preprocess_supervised_example(ex, tokenizer, input_field, output_field), batch_size=128, num_cpus=num_cpus_used_by_tokenizer(tokenizer), output_exemplar=output_exemplar)  # type: ignore
+    dataset = dataset.build_or_load_cache(config.cache_dir, await_finished=True)  # type: ignore
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return dataset.map(lambda ex: _prepare_supervised_example(ex, tokenizer))
+
+
+@dataclass
 class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
     """This class supports loading data both from HF Datasets and from a raw dataset of jsonl urls"""
+
+    cache_dir: Optional[str] = "cache/"
 
     def train_set(
         self, seq_len: int, monitors: Union[bool, List[MetricsMonitor]] = True, *, key: Optional[PRNGKeyArray] = None
@@ -617,7 +676,7 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
             return {}
 
     @property
-    def sources(self) -> dict[str, LMDatasetSourceConfig]:
+    def sources(self) -> Mapping[str, LMDatasetSourceConfig]:
         return {"": self}
 
     @cached_property
@@ -646,10 +705,14 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
     def build_or_load_cache(
         self, split: str, monitors: Union[bool, List[MetricsMonitor]] = True, logger_name: Optional[str] = None
     ) -> Optional[TreeCache[BatchEncoding]]:
+        if self.cache_dir is None:
+            raise ValueError("cache_dir cannot be None")
+
         split_cache_dir = os.path.join(self.cache_dir, split)
         name = logger_name or os.path.basename(self.cache_dir)
 
         try:
+            # TODO: pass in options
             return TreeCache.load(split_cache_dir, exemplar={"input_ids": np.zeros(0, dtype=np.int32)})
         except FileNotFoundError:
             pass
@@ -669,20 +732,16 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
         elif monitors is False:
             monitors = []
 
-        bt = BatchTokenizer(
-            self.the_tokenizer, enforce_bos=True, enforce_eos=self.enforce_eos, batch_size=self.tokenizer_batch_size
-        )
+        bt = BatchTokenizer(self.the_tokenizer, enforce_bos=True, enforce_eos=self.enforce_eos)
 
         return build_or_load_cache(
             split_cache_dir,
             source,
             bt,
-            await_finished=False,
             monitors=monitors,
-            cache_config={
-                "tokenizer": self.the_tokenizer.name_or_path,
-                "vocab_size": self.the_tokenizer.vocab_size,
-            },
+            await_finished=False,
+            options=self.cache_options,
+            split=split,
         )
 
 
@@ -716,6 +775,8 @@ class PassthroughTokenizer(PreTrainedTokenizer):
 @dataclass
 class LMMixtureDatasetConfig(LMTaskConfig):
     """This class represents a mixture of datasets with their associated weights."""
+
+    cache_dir: Optional[str] = "cache/"
 
     # data source configs and weights
     configs: Dict[str, LMDatasetSourceConfig] = field(default_factory=dict)
@@ -804,10 +865,19 @@ class LMMixtureDatasetConfig(LMTaskConfig):
             if weight == 0 and split == "train":
                 continue
 
-            source_config_dict = source_config.__dict__
+            source_config_dict = dict(**source_config.__dict__)
+
+            if source_config.cache_dir is None:
+                # replace with the main cache dir/{name}
+                if self.cache_dir is None:
+                    raise ValueError(
+                        "If the 'main' cache_dir is None, then all component cache_dirs must be non-None, but"
+                        f"{name}'s cache_dir is None."
+                    )
+                cache_dir = os.path.join(self.cache_dir, name)
+                source_config_dict["cache_dir"] = cache_dir
 
             dataset = LMDatasetConfig(
-                cache_dir=os.path.join(self.cache_dir, name),
                 **source_config_dict,
                 **task_config_dict,
             )
@@ -820,12 +890,14 @@ class LMMixtureDatasetConfig(LMTaskConfig):
 
         # in practice it works best if we block on validation caches
         if split == "validation":
-            logger.info("Waiting for validation caches to finish building...")
             for cache in caches.values():
                 cache.await_finished()
+
+        else:
+            logger.info(f"Not waiting for {split} caches to finish building")
 
         return caches
 
     @property
-    def sources(self) -> dict[str, LMDatasetSourceConfig]:
+    def sources(self) -> Mapping[str, LMDatasetSourceConfig]:
         return self.configs

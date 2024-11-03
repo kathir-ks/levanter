@@ -12,12 +12,17 @@ from test_utils import skip_if_hf_model_not_accessible, skip_if_no_soundlibs
 @skip_if_no_soundlibs
 @skip_if_hf_model_not_accessible("openai/whisper-tiny")
 def test_whisper_batch_processor():
-    processor = AutoProcessor.from_pretrained("openai/whisper-tiny")
-    tokenizer = AutoTokenizer.from_pretrained("openai/whisper-tiny")
-    ds = load_dataset("WillHeld/test_librispeech_parquet", split="validation").select_columns(["audio", "text"])
-    batch_processor = BatchAudioProcessor(processor, tokenizer)
-    inputs = [(audio["array"], audio["sampling_rate"], text) for audio, text in zip(ds[:16]["audio"], ds[:16]["text"])]
-    batch_processor(inputs)
+    try:
+        processor = AutoProcessor.from_pretrained("openai/whisper-tiny")
+        tokenizer = AutoTokenizer.from_pretrained("openai/whisper-tiny")
+        ds = load_dataset("WillHeld/test_librispeech_parquet", split="validation").select_columns(["audio", "text"])
+        batch_processor = BatchAudioProcessor(processor, tokenizer)
+        inputs = [
+            (audio["array"], audio["sampling_rate"], text) for audio, text in zip(ds[:16]["audio"], ds[:16]["text"])
+        ]
+        batch_processor(inputs)
+    except FileNotFoundError:
+        pytest.skip("No whisper model found. Probably HF is being flaky.")
 
 
 @skip_if_no_soundlibs
@@ -80,3 +85,13 @@ def test_hf_audio_serial_cache():
             assert ex["input_features"].shape == (80, 3000), ex["input_features"].shape
             assert ex["input_ids"].shape == (1024,), ex["input_ids"].shape
             assert ex["attention_mask"].shape == (1024,), ex["attention_mask"].shape
+
+
+@skip_if_no_soundlibs
+@skip_if_hf_model_not_accessible("openai/whisper-tiny")
+def test_metadata_works():
+    processor = AutoProcessor.from_pretrained("openai/whisper-tiny")
+    tokenizer = AutoTokenizer.from_pretrained("openai/whisper-tiny")
+    batch_processor = BatchAudioProcessor(processor, tokenizer)
+    # test this doesn't throw
+    assert len(batch_processor.metadata)

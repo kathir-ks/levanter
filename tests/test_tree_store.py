@@ -1,5 +1,5 @@
 import tempfile
-from typing import Iterator, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence
 
 import numpy as np
 import pytest
@@ -11,9 +11,6 @@ from levanter.store.tree_store import TreeStore
 
 
 class SimpleProcessor(BatchProcessor[Sequence[int], dict[str, np.ndarray]]):
-    def __init__(self, batch_size: int = 8):
-        self._batch_size = batch_size
-
     def __call__(self, batch: Sequence[Sequence[int]]) -> Sequence[dict[str, Sequence[int]]]:
         return [{"data": x} for x in batch]
 
@@ -22,12 +19,12 @@ class SimpleProcessor(BatchProcessor[Sequence[int], dict[str, np.ndarray]]):
         return {"data": np.array([0], dtype=np.int64)}
 
     @property
-    def batch_size(self) -> int:
-        return self._batch_size
-
-    @property
     def num_cpus(self) -> int:
         return 1
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        return {}
 
 
 class SimpleShardSource(ShardedDataSource[List[int]]):
@@ -52,7 +49,7 @@ def test_tree_builder_with_processor():
         processor = SimpleProcessor()
         source = SimpleShardSource()
 
-        for batch in batched(source, processor.batch_size):
+        for batch in batched(source, 8):
             processed = processor(batch)
             builder.extend(processed)
 
@@ -241,6 +238,34 @@ def test_reading_from_written():
             {"a": np.array([5.0, 6.0]), "b": np.array([7.0, 8.0])},
         ]
         builder.extend(batch)
+
+        del builder
+
+        builder2 = TreeStore.open(exemplar, tmpdir, mode="r")
+
+        for i, result in enumerate(builder2):
+            if i == 0:
+                assert np.all(result["a"] == np.array([1.0, 2.0]))
+                assert np.all(result["b"] == np.array([3.0, 4.0]))
+            elif i == 1:
+                assert np.all(result["a"] == np.array([5.0, 6.0]))
+                assert np.all(result["b"] == np.array([7.0, 8.0]))
+            else:
+                pytest.fail("Unexpected index")
+
+
+def test_using_prepared_batches():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        exemplar = {"a": np.array([0], dtype=np.float64), "b": np.array([0], dtype=np.float64)}
+        builder = TreeStore.open(exemplar, tmpdir, mode="w")
+        preparer = builder.batch_preparer
+
+        batch = [
+            {"a": np.array([1.0, 2.0]), "b": np.array([3.0, 4.0])},
+            {"a": np.array([5.0, 6.0]), "b": np.array([7.0, 8.0])},
+        ]
+        batch = preparer(batch)
+        builder.extend_with_batch(batch)
 
         del builder
 

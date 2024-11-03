@@ -6,13 +6,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from levanter.store.jagged_array import JaggedArrayStore
+from levanter.store.jagged_array import JaggedArrayStore, PreparedBatch
 
 
 class TestJaggedArrayStore:
-    def test_append_and_get(self):
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    def test_append_and_get(self, cache_metadata):
         with tempfile.TemporaryDirectory() as tmpdir:
-            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32)
+            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32, cache_metadata=cache_metadata)
 
             data1 = jnp.array([[1.0, 2.0], [3.0, 4.0]])
             data2 = jnp.array([[5.0]])
@@ -31,9 +32,10 @@ class TestJaggedArrayStore:
             # result_slice = builder[0:2]
             # assert isinstance(result_slice, JaggedArray)
 
-    def test_extend_with_multiple(self):
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    def test_extend_with_multiple(self, cache_metadata):
         with tempfile.TemporaryDirectory() as tmpdir:
-            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32)
+            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32, cache_metadata=cache_metadata)
 
             data1 = jnp.array([[1.0, 2.0], [3.0, 4.0]])
             data2 = jnp.array([[5.0]])
@@ -48,15 +50,85 @@ class TestJaggedArrayStore:
             result2 = builder[1]
             assert jnp.all(result2 == data2)
 
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    def test_extend_with_prepared_batch(self, cache_metadata):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32, cache_metadata=cache_metadata)
+
+            data1 = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=jnp.float32)
+            data2 = np.array([[5.0]], dtype=jnp.float32)
+            prepared = PreparedBatch.from_batch([data1, data2])
+
+            builder.extend(prepared)
+
+            assert len(builder) == 2
+
+            result1 = builder[0]
+            assert jnp.all(result1 == data1)
+
+            result2 = builder[1]
+            assert jnp.all(result2 == data2)
+
+            # extendd with more data
+            data3 = jnp.array([[6.0, 7.0], [8.0, 9.0]])
+            data4 = jnp.array([[10.0]])
+            prepared2 = PreparedBatch.from_batch([data3, data4])
+
+            builder.extend(prepared2)
+
+            assert len(builder) == 4
+
+            result3 = builder[2]
+            assert jnp.all(result3 == data3)
+
+            result4 = builder[3]
+            assert jnp.all(result4 == data4)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    async def test_extend_with_prepared_batch_async(self, cache_metadata):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32, cache_metadata=cache_metadata)
+
+            data1 = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=jnp.float32)
+            data2 = np.array([[5.0]], dtype=jnp.float32)
+            prepared = PreparedBatch.from_batch([data1, data2])
+
+            await builder.extend_async(prepared)
+
+            assert len(builder) == 2
+
+            result1 = builder[0]
+            assert jnp.all(result1 == data1)
+
+            result2 = builder[1]
+            assert jnp.all(result2 == data2)
+
+            # extendd with more data
+            data3 = jnp.array([[6.0, 7.0], [8.0, 9.0]])
+            data4 = jnp.array([[10.0]])
+            prepared2 = PreparedBatch.from_batch([data3, data4])
+
+            await builder.extend_async(prepared2)
+
+            assert len(builder) == 4
+
+            result3 = builder[2]
+            assert jnp.all(result3 == data3)
+
+            result4 = builder[3]
+            assert jnp.all(result4 == data4)
+
     def test_append_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             builder = JaggedArrayStore.open(tmpdir, item_rank=1, dtype=jnp.float32)
             with pytest.raises(ValueError):
                 builder.append(jnp.array([[1.0, 2.0]]))
 
-    def test_append_single_rank(self):
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    def test_append_single_rank(self, cache_metadata):
         with tempfile.TemporaryDirectory() as tmpdir:
-            builder = JaggedArrayStore.open(tmpdir, item_rank=1, dtype=jnp.float32)
+            builder = JaggedArrayStore.open(tmpdir, item_rank=1, dtype=jnp.float32, cache_metadata=cache_metadata)
 
             data = jnp.array([1.0, 2.0, 3.0])
             builder.append(data)
@@ -66,9 +138,10 @@ class TestJaggedArrayStore:
             result = builder[0]
             assert jnp.all(result == data)
 
-    def test_append_multi_rank(self):
+    @pytest.mark.parametrize("cache_metadata", [True, False])
+    def test_append_multi_rank(self, cache_metadata):
         with tempfile.TemporaryDirectory() as tmpdir:
-            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32)
+            builder = JaggedArrayStore.open(tmpdir, item_rank=2, dtype=jnp.float32, cache_metadata=cache_metadata)
 
             data1 = jnp.array([[1.0, 2.0], [3.0, 4.0]])
             data2 = jnp.array([[5.0, 6.0], [7.0, 8.0]])
@@ -105,14 +178,18 @@ class TestJaggedArrayStore:
             #     builder[::2]
 
 
-async def create_builder_with_data(directory, num_sequences: int, sequence_length: int | tuple[int, ...]):
+async def create_builder_with_data(
+    directory, num_sequences: int, sequence_length: int | tuple[int, ...], cache_metadata: bool = True
+) -> JaggedArrayStore:
     if isinstance(sequence_length, int):
         sequence_length = (sequence_length,)
 
     """Helper function to create a JaggedArrayStore with specific data."""
     seed = jax.random.PRNGKey(num_sequences * math.prod(sequence_length))
 
-    builder = await JaggedArrayStore.open_async(directory, item_rank=len(sequence_length), dtype=jnp.int64)
+    builder = await JaggedArrayStore.open_async(
+        directory, item_rank=len(sequence_length), dtype=jnp.int64, cache_metadata=cache_metadata
+    )
     for i in range(num_sequences):
         key, seed = jax.random.split(seed)
         data = jax.random.randint(key, sequence_length, 0, 100)
@@ -122,7 +199,7 @@ async def create_builder_with_data(directory, num_sequences: int, sequence_lengt
 
 
 def create_builder_with_data_sync(
-    directory, num_sequences: int, sequence_length: int | tuple[int, ...]
+    directory, num_sequences: int, sequence_length: int | tuple[int, ...], cache_metadata: bool = True
 ) -> JaggedArrayStore:
     if isinstance(sequence_length, int):
         sequence_length = (sequence_length,)
@@ -130,7 +207,9 @@ def create_builder_with_data_sync(
     """Helper function to create a JaggedArrayStore with specific data."""
     seed = jax.random.PRNGKey(num_sequences * math.prod(sequence_length))
 
-    builder = JaggedArrayStore.open(directory, item_rank=len(sequence_length), dtype=jnp.int64)
+    builder = JaggedArrayStore.open(
+        directory, item_rank=len(sequence_length), dtype=jnp.int64, cache_metadata=cache_metadata
+    )
     for i in range(num_sequences):
         key, seed = jax.random.split(seed)
         data = jax.random.randint(key, sequence_length, 0, 100)
@@ -190,9 +269,12 @@ async def test_trim_to_size_larger_than_current():
 
 
 @pytest.mark.asyncio
-async def test_trim_to_size_with_shapes_async():
+@pytest.mark.parametrize("cache_metadata", [True, False])
+async def test_trim_to_size_with_shapes_async(cache_metadata):
     tmpdir = tempfile.TemporaryDirectory().name
-    builder = await create_builder_with_data(tmpdir, num_sequences=10, sequence_length=(10, 100))
+    builder = await create_builder_with_data(
+        tmpdir, num_sequences=10, sequence_length=(10, 100), cache_metadata=cache_metadata
+    )
     expected_shapes = list(await builder.shapes[0:10].read())
 
     # Trim to smaller size
@@ -205,9 +287,12 @@ async def test_trim_to_size_with_shapes_async():
     assert np.array_equal(trimmed_shapes, jnp.stack(expected_shapes[:5]))
 
 
-def test_trim_to_size():
+@pytest.mark.parametrize("cache_metadata", [True, False])
+def test_trim_to_size_sync(cache_metadata):
     tmpdir = tempfile.TemporaryDirectory().name
-    builder = create_builder_with_data_sync(tmpdir, num_sequences=10, sequence_length=1000)
+    builder = create_builder_with_data_sync(
+        tmpdir, num_sequences=10, sequence_length=1000, cache_metadata=cache_metadata
+    )
 
     # Initial size
     initial_size = len(builder)

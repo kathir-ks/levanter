@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import Generic, List, TypeVar
+from typing import Generic, List, Sequence, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +10,7 @@ from jaxtyping import PyTree
 
 from haliax.jax_utils import is_jax_array_like
 
-from .jagged_array import JaggedArrayStore
+from .jagged_array import JaggedArrayStore, PreparedBatch
 
 
 T = TypeVar("T", bound=PyTree)
@@ -49,22 +49,25 @@ class TreeStore(Generic[T]):
         self.mode = mode
         self.tree = tree
 
+    @property
+    def batch_preparer(self):
+        return TreeBatchPreparer(jtu.tree_map(lambda writer: 9, self.tree, is_leaf=heuristic_is_leaf))
+
     @staticmethod
-    def open(exemplar: T, path: str, *, mode="a") -> "TreeStore":
+    def open(exemplar: T, path: str, *, mode="a", cache_metadata: bool = False) -> "TreeStore":
         """
         Open a TreeStoreBuilder from a file.
         """
-        tree = _construct_builder_tree(exemplar, path, mode)
+        tree = _construct_builder_tree(exemplar, path, mode, cache_metadata)
         return TreeStore(tree, path, mode)
 
     def append(self, ex: T):
         return self.extend([ex])
 
-    def extend(self, batch: List[T]):
+    def extend(self, batch: Sequence[T]):
         """
         Append a batch of data to the store.
         """
-        # TODO: I do wish zarr supported async
         jtu.tree_map(
             lambda writer, *xs: writer.extend([np.asarray(x) for x in xs]),
             self.tree,
@@ -80,7 +83,7 @@ class TreeStore(Generic[T]):
         For instance, HF's BatchEncoding is a dict of lists of numpy arrays.
         """
         jtu.tree_map(
-            lambda writer, xs: writer.extend([np.asarray(x) for x in xs]),
+            lambda writer, xs: writer.extend(xs if isinstance(xs, PreparedBatch) else [np.asarray(x) for x in xs]),
             self.tree,
             batch,
             is_leaf=heuristic_is_leaf_batched,
@@ -94,7 +97,9 @@ class TreeStore(Generic[T]):
         For instance, HF's BatchEncoding is a dict of lists of numpy arrays.
         """
         futures = jtu.tree_map(
-            lambda writer, xs: writer.extend_async([np.asarray(x) for x in xs]),
+            lambda writer, xs: writer.extend_async(
+                xs if isinstance(xs, PreparedBatch) else [np.asarray(x) for x in xs]
+            ),
             self.tree,
             batch,
             is_leaf=heuristic_is_leaf_batched,
@@ -168,12 +173,18 @@ class TreeStore(Generic[T]):
         return out
 
 
-def _construct_builder_tree(exemplar, path, mode):
+def _construct_builder_tree(exemplar, path, mode, cache_metadata):
     def open_builder(tree_path, item):
         item = np.asarray(item)
         rank = item.ndim
         render_tree_path = "/".join(_render_path_elem(x) for x in tree_path)
-        return JaggedArrayStore.open(os.path.join(path, render_tree_path), mode=mode, item_rank=rank, dtype=item.dtype)
+        return JaggedArrayStore.open(
+            os.path.join(path, render_tree_path),
+            mode=mode,
+            item_rank=rank,
+            dtype=item.dtype,
+            cache_metadata=cache_metadata,
+        )
 
     return jtu.tree_map_with_path(open_builder, exemplar, is_leaf=heuristic_is_leaf)
 
@@ -192,46 +203,14 @@ def _render_path_elem(x):
             return str(x)
 
 
-# class TokenSeqDataset:
-#     """
-#     A dataset of sequences of tokens of fixed length, materialized from a collection of JaggedArrayStores,
-#     which have typically much longer sequences. This class takes consecutive sequences of tokens from the builders
-#     and slices/concats them to form the dataset.
-#     """
-#
-#     def __init__(
-#         self, token_arrays: Sequence[JaggedArrayStore], token_counts: Sequence[int], seq_len: int, pad_token: int
-#     ):
-#         self.token_arrays = token_arrays
-#
-#         def _round_to_nearest_multiple(x, y):
-#             return x + y - x % y
-#
-#         token_counts_padded = np.array([_round_to_nearest_multiple(x, seq_len) for x in token_counts])
-#         seq_counts = token_counts_padded // seq_len
-#         self.seq_counts_cumsum = np.concatenate([np.asarray([0]), np.cumsum(seq_counts)])
-#
-#         self.seq_len = seq_len
-#         self.pad_token = pad_token
-#
-#     def __len__(self):
-#         return self.seq_counts_cumsum[-1]
-#
-#     def __getitem__(self, seq_id):
-#         return asyncio.run(self.get_item_async(seq_id))
-#
-#     async def get_item_async(self, seq_id):
-#         # TODO: accept slices and such?
-#         shard_id = np.searchsorted(self.seq_counts_cumsum, seq_id, side="right") - 1
-#         shard_start = self.seq_counts_cumsum[shard_id]
-#         shard_end = self.seq_counts_cumsum[shard_id + 1]
-#         shard_seq_id = seq_id - shard_start
-#
-#         shard_seq_start = shard_seq_id * self.seq_len
-#         shard_seq_end = min((shard_seq_id + 1) * self.seq_len, self.token_arrays[shard_id].data_size)
-#
-#         shard_seq = await self.token_arrays[shard_id].data[shard_seq_start:shard_seq_end].read()
-#         pad_len = self.seq_len - (shard_seq_end - shard_seq_start)
-#         padded_seq = np.concatenate([shard_seq, np.full(pad_len, self.pad_token, dtype=shard_seq.dtype)])
-#
-#         return padded_seq
+class TreeBatchPreparer(Generic[T]):
+    def __init__(self, exemplar: T):
+        self.exemplar = exemplar
+
+    def __call__(self, batch: List[T]) -> PyTree:
+        return jtu.tree_map(
+            lambda _, *xs: PreparedBatch.from_batch([np.asarray(x) for x in xs]),
+            self.exemplar,
+            *batch,
+            is_leaf=heuristic_is_leaf,
+        )

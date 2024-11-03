@@ -20,6 +20,7 @@ from typing import (
 import datasets
 import fsspec
 import numpy as np
+import pyarrow.parquet as pq
 
 from levanter.utils import fsspec_utils
 
@@ -113,7 +114,14 @@ class ShardedDataSource(Generic[T_co]):
         return _MappedShardedDataSource(self, fn)
 
     def map_batches(
-        self, fn: Callable[[list[T_co]], BatchResult], batch_size, *, num_cpus=1, num_gpus=0, **resources
+        self,
+        fn: Callable[[list[T_co]], BatchResult],
+        batch_size,
+        *,
+        num_cpus=1,
+        num_gpus=0,
+        output_exemplar=None,
+        **resources,
     ) -> "ShardedDataSource[dict]":
         """
         **Lazily** map a function over batches of data. This is useful for doing things like batching data for a model,
@@ -131,7 +139,9 @@ class ShardedDataSource(Generic[T_co]):
         Returns:
             A new ShardedDataset.
         """
-        return _BatchMappedShardedDataSource(self, fn, batch_size, num_cpus=num_cpus, num_gpus=num_gpus, **resources)
+        return _BatchMappedShardedDataSource(
+            self, fn, batch_size, num_cpus=num_cpus, num_gpus=num_gpus, output_exemplar=output_exemplar, **resources
+        )
 
 
 def datasource_from_hf(id: str, *, split, **kwargs) -> ShardedDataSource[dict]:
@@ -147,6 +157,10 @@ def datasource_from_jsonl(urls_or_paths: Sequence[str]) -> ShardedDataSource[dic
 
 def datasource_from_json(urls_or_paths: Sequence[str]) -> ShardedDataSource[dict]:
     return JsonDataSource(urls_or_paths)
+
+
+def datasource_from_parquet(urls_or_paths: Sequence[str]) -> ShardedDataSource[dict]:
+    return ParquetDataSource(urls_or_paths)
 
 
 class WrappedHFDataSource(ShardedDataSource[dict]):
@@ -219,27 +233,59 @@ class TextUrlDataSource(ShardedDataSource[str]):
         compression = "infer"
         if url.endswith(".zstd"):  # hacky way to detect zstd
             compression = "zstd"
-        with fsspec.open(url, "r", compression=compression) as f:
-            format = _sniff_format_for_dataset(url)
-            match format:
-                case ".jsonl":
+
+        format = _sniff_format_for_dataset(url)
+        match format:
+            case ".jsonl":
+                with fsspec.open(url, "r", compression=compression) as f:
                     # TODO: would be nice if we could seek faster than this. Right now, all we do is skip json parsing
                     # which is not nothing, but not ideal.
                     for line in f:
                         if i >= row:
                             yield json.loads(line)[self.text_key]
                         i += 1
-                case ".txt":
+            case ".txt":
+                with fsspec.open(url, "r", compression=compression) as f:
                     for line in f:
                         if i >= row:
                             yield line
                         i += 1
-                case ".json":
+            case ".json":
+                with fsspec.open(url, "r", compression=compression) as f:
                     data = json.load(f)
                     for doc in data[row:]:
                         yield doc[self.text_key]
-                case _:
-                    raise ValueError(f"Unknown format {format}")
+            case ".parquet":
+                with fsspec.open(url, "rb", compression=compression) as f:
+                    parquet_file = pq.ParquetFile(f)
+                    total_rows = parquet_file.metadata.num_rows
+                    if row >= total_rows:
+                        return iter([])
+
+                    num_row_groups = parquet_file.metadata.num_row_groups
+
+                    # Compute cumulative row counts
+                    row_counts = [parquet_file.metadata.row_group(i).num_rows for i in range(num_row_groups)]
+                    cumulative_rows = [0]
+                    for count in row_counts:
+                        cumulative_rows.append(cumulative_rows[-1] + count)
+
+                    # Find the starting row group and row within it
+                    for idx, cum_row in enumerate(cumulative_rows):
+                        if cum_row > row:
+                            row_group_index = idx - 1
+                            start_row_in_group = row - cumulative_rows[row_group_index]
+                            break
+
+                    # Read from the starting row group onwards
+                    for rg_idx in range(row_group_index, parquet_file.num_row_groups):
+                        table = parquet_file.read_row_group(rg_idx, columns=[self.text_key])
+                        if rg_idx == row_group_index:
+                            table = table.slice(start_row_in_group)
+                        for record in table.to_pylist():
+                            yield record[self.text_key]
+            case _:
+                raise ValueError(f"Unknown format {format}")
 
 
 class AudioTextUrlDataSource(ShardedDataSource[Tuple[np.ndarray, int, str]]):
@@ -313,7 +359,7 @@ class AudioTextUrlDataSource(ShardedDataSource[Tuple[np.ndarray, int, str]]):
 
 
 def _sniff_format_for_dataset(url):
-    good_formats = [".jsonl", ".txt", ".json"]
+    good_formats = [".jsonl", ".txt", ".json", ".parquet"]
     format_from_url = None
     # try both with and without compression (could be gz, bz2, etc, so look at the "first" extension)
     extensions = [os.path.splitext(url)[1], os.path.splitext(os.path.splitext(url)[0])[1]]
@@ -417,6 +463,49 @@ class JsonDataSource(ShardedDataSource[dict]):
             return iter(data[row:])
 
 
+class ParquetDataSource(ShardedDataSource[dict]):
+    def __init__(self, urls):
+        self.urls = urls
+        self._shard_name_to_url_mapping = _mk_shard_name_mapping(urls)
+
+    @property
+    def shard_names(self) -> Sequence[str]:
+        return list(self._shard_name_to_url_mapping.keys())
+
+    def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
+        url = self._shard_name_to_url_mapping[shard_name]
+        with fsspec.open(url, "rb", compression="infer") as f:
+            parquet_file = pq.ParquetFile(f)
+            total_rows = parquet_file.metadata.num_rows
+            if row >= total_rows:
+                return iter([])
+
+            num_row_groups = parquet_file.metadata.num_row_groups
+
+            # Compute cumulative row counts
+            row_counts = [parquet_file.metadata.row_group(i).num_rows for i in range(num_row_groups)]
+            cumulative_rows = [0]
+            for count in row_counts:
+                cumulative_rows.append(cumulative_rows[-1] + count)
+
+            # find starting row group and also find the row within it
+            for idx, cum_row in enumerate(cumulative_rows):
+                if cum_row > row:
+                    row_group_index = idx - 1
+                    start_row_in_group = row - cumulative_rows[row_group_index]
+                    break
+
+            # read from the starting row group onwards
+            for rg_idx in range(row_group_index, parquet_file.num_row_groups):
+                table = parquet_file.read_row_group(rg_idx)
+
+                # if we're in the row group we want, slice the table at/from the row we want
+                if rg_idx == row_group_index:
+                    table = table.slice(start_row_in_group)
+
+                yield from table.to_pylist()
+
+
 def _mk_shard_name_mapping(urls):
     _shard_name_to_url_mapping = {}
     # remove common prefix
@@ -478,10 +567,13 @@ class _BatchMappedShardedDataSource(ShardedDataSource[T], _TransformedDataset):
         batch_size,
         num_cpus=1,
         num_gpus=0,
+        output_exemplar=None,
         **resources,
     ):
         self.source = source
-        self._transform = _BatchMapTransform(fn, batch_size, num_cpus, num_gpus, resources)
+        self._transform = _BatchMapTransform(
+            fn, batch_size, num_cpus, num_gpus, resources, output_exemplar=output_exemplar
+        )
 
     @property
     def shard_names(self) -> Sequence[str]:
