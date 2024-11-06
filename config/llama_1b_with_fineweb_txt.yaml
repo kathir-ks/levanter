@@ -1,4 +1,4 @@
-data: !include data/redpajama_1b_source.yaml
+data: !include data/redpajama_1t_source.yaml
 model:  # 1B class model
   type: llama
   seq_len: 2048

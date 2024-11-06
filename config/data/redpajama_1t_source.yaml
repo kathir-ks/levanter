@@ -1,5 +1,5 @@
-id: togethercomputer/RedPajama-Data-1T
-cache_dir: gs://levanter-data/tokenized/redpajama/
-tokenizer: EleutherAI/gpt-neox-20b
+id: KathirKs/fineweb-edu-hindi
+cache_dir: gs://fineweb-edu-v3/fineweb-edu-hindi/
+tokenizer: KathirKs/hindi_tokenizer
 splits:
   - train

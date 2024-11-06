@@ -1,4 +1,4 @@
-id: togethercomputer/RedPajama-Data-1T-Sample
+id: kathirKs/fineweb-edu-hindi
 cache_dir: gs://levanter-data/tokenized/redpajama-sample/
 tokenizer: EleutherAI/gpt-neox-20b
 splits:
