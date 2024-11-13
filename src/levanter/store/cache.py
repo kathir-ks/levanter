@@ -191,6 +191,7 @@ class TreeCache(AsyncDataset[T_co]):
         ledger: Optional["CacheLedger"],
         _broker,  # handle of _TreeStoreCacheBuilder
     ):
+        super().__init__()
         self.cache_dir = cache_dir
         self.ledger = ledger
         self._was_already_finished = ledger is not None and ledger.is_finished
@@ -840,7 +841,7 @@ class _ShardFinished:
     path_to_shard: str
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, runtime_env=RuntimeEnv(env_vars={"JAX_PLATFORMS": "cpu"}))
 def _core_writer_task(
     parent,
     cache_dir,
