@@ -36,6 +36,7 @@ def main():
     cli.add_arg(parser, config, ["--github_user"], type=str)
     cli.add_arg(parser, config, ["--github_token"], type=str)
     cli.add_arg(parser, config, ["--extra_context"], type=Path, required=False, default=None)
+    cli.add_arg(parser, config, ["--queued"], type=bool, required=False, default=True)
 
     parser.add_argument(
         "-e", "--env", action="append", nargs=2, metavar=("KEY", "VALUE"), default=list(config.get("env", {}).items())
@@ -65,6 +66,7 @@ def main():
     github_user = args.github_user
     github_token = args.github_token
     extra_context = args.extra_context
+    queued = args.queued
 
     if zone is None:
         zone = cli.gcloud_config()["zone"]
@@ -122,6 +124,7 @@ def main():
                 command=command,
                 tpu_name=tpu_name,
                 tpu_type=tpu_type,
+                queued=queued, 
                 capacity_type=capacity_type,
                 zone=zone,
                 node_count=node_count,

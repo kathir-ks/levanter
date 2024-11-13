@@ -107,12 +107,22 @@ def describe_tpu_vm(tpu_name, zone):
         return None
 
 
-def start_tpu_vm_queued_resources(tpu_name, *, tpu_type, capacity_type, version, zone, node_count):
+def start_tpu_vm_queued_resources(tpu_name, *, tpu_type, queued, capacity_type, version, zone, node_count):
     # ensure alpha is enabled
-    run_command("gcloud", "components", "install", "alpha", "--quiet")
+    # run_command("gcloud", "components", "install", "alpha", "--quiet")
+    # sudo apt-get install google-cloud-cli
+    run_command("sudo", "apt-get", "install", "google-cloud-cli")
     if version is None:
         version = "tpu-ubuntu2204-base"
-    tpu_stat = describe_tpu_queued_resource(tpu_name, zone)
+    if queued:
+        tpu_stat = describe_tpu_vm(tpu_name, zone)
+    else:
+        tpu_stat = describe_tpu_queued_resource(tpu_name, zone)
+    # print(type(tpu_stat))
+    # print(tpu_stat.keys())  
+    # print(tpu_stat['state'])
+    if tpu_stat['state'] == 'READY':
+        return
     if tpu_stat is not None:
         if tpu_stat["state"]["state"] in ["FAILED", "SUSPENDED"]:
             print("TPU suspended,  deleting...", file=sys.stderr)
@@ -191,6 +201,7 @@ def launch_job(
     command: list[str],
     tpu_name: str,
     tpu_type: str,
+    queued: bool, 
     capacity_type: str,
     zone: str,
     node_count: int,
@@ -202,6 +213,7 @@ def launch_job(
     start_tpu_vm_queued_resources(
         tpu_name=tpu_name,
         tpu_type=tpu_type,
+        queued=queued, 
         capacity_type=capacity_type,
         version=version,
         zone=zone,
@@ -217,8 +229,10 @@ def launch_job(
     )
 
     docker_command = make_docker_run_command(full_image_id, command, env=env, foreground=foreground)
-
+    print("docker command sucessful")
+    time.sleep(10)
     print(f"Running on tpu_name... {tpu_name}")
+    time.sleep(3)
     tpu_ssh(tpu_name, zone, node_count, *docker_command)
 
 
@@ -248,6 +262,8 @@ def add_ssh_key(ssh_key_filename):
 
 
 def tpu_ssh(tpu_name, zone, node_count, *args, ignore_failure=False):
+
+    print("running ssh")
     try:
         add_ssh_key(os.path.expanduser("~/.ssh/google_compute_engine"))
     except subprocess.CalledProcessError as e:
