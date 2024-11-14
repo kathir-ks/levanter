@@ -1,4 +1,9 @@
-data: !include data/redpajama_1t_source.yaml
+data:
+  id: KathirKs/fineweb-edu-hindi
+  cache_dir: gs://fineweb-edu-v3/fineweb-edu-hindi/
+  tokenizer: KathirKs/hindi_tokenizer
+  splits:
+    - train
 model:  # 1B class model
   type: llama
   seq_len: 2048
