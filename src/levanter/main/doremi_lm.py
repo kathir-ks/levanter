@@ -109,12 +109,24 @@ def main(config: TrainLmConfig):
         train_datasets = config.data.training_sets(ref_model.Pos.size)
         valid_datasets = config.data.validation_sets(ref_model.Pos.size)
 
-        train_datasets = {
-            k: CausalLmDataset(v, config.model.Pos, config.model.KeyPos, ignore_index=config.data.ignore_token_id)
+        causal_train_datasets = {
+            k: CausalLmDataset(
+                v,
+                config.model.Pos,
+                config.model.KeyPos,
+                ignore_index=config.data.ignore_token_id,
+                eos_id=tokenizer.eos_token_id,
+            )
             for k, v in train_datasets.items()
         }
         valid_datasets = {
-            k: CausalLmDataset(v, config.model.Pos, config.model.KeyPos, ignore_index=config.data.ignore_token_id)
+            k: CausalLmDataset(
+                v,
+                config.model.Pos,
+                config.model.KeyPos,
+                ignore_index=config.data.ignore_token_id,
+                eos_id=tokenizer.eos_token_id,
+            )
             for k, v in valid_datasets.items()
         }
 
@@ -122,7 +134,7 @@ def main(config: TrainLmConfig):
             loss_function,
             proxy_model,
             ref=ref_model,
-            data_sources=train_datasets,
+            data_sources=causal_train_datasets,
             trainer_config=config.trainer,
             optimizer=optimizer,
             domain_weight_step_size=config.doremi.domain_weight_step_size,

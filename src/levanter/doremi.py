@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Optional, Tuple, TypeVar
+from typing import Mapping, Optional, Tuple, TypeVar
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -12,14 +12,14 @@ import haliax as hax
 from haliax.types import IntScalar
 
 import levanter.tracker
-from levanter.callbacks import eval_loss_loop
+from levanter.callbacks import M, StepInfo, eval_loss_loop
 from levanter.checkpoint import load_checkpoint_or_initialize
 from levanter.data import AsyncDataset, MappedAsyncDataset
 from levanter.data.mixture import MixtureDataset
 from levanter.tracker import capture_time
-from levanter.trainer import M, StepInfo, Trainer, TrainerConfig, TrainerState
-from levanter.types import ComputeLossFunction
+from levanter.trainer import Trainer, TrainerConfig, TrainerState
 from levanter.utils.tree_utils import inference_mode
+from levanter.utils.types import ComputeLossFunction
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ def estimate_mixture_weights(
     loss_fn: ComputeLossFunction[M, T],
     initial_proxy: M,
     ref: M,
-    data_sources: dict[str, AsyncDataset[T]],
+    data_sources: Mapping[str, AsyncDataset[T]],
     sampling_weights: Optional[dict[str, float]] = None,
     *,
     validation_sets: Optional[dict[str, AsyncDataset[T]]] = None,
@@ -112,7 +112,7 @@ def estimate_mixture_weights(
                     max_batches=trainer_config.max_eval_batches,
                 )
                 print(f"Loss of ref model on domain {domain}: {loss:.3f}")
-                levanter.tracker.log_metrics({f"eval/ref/{domain}/loss": loss}, step=0, commit=False)
+                levanter.tracker.log({f"eval/ref/{domain}/loss": loss}, step=0, commit=False)
 
         if validation_sets is not None:
             for domain, dataset in validation_sets.items():
@@ -167,7 +167,7 @@ def estimate_mixture_weights(
         # need to use where b/c we're in jit
         per_domain_dict = {k: jnp.where(v == 0.0, jnp.nan, v) for k, v in per_domain_dict.items()}
 
-        levanter.tracker.jit_log_metrics(
+        levanter.tracker.jit_log(
             {
                 "change_in_alpha": alpha_distance.scalar(),
                 "alpha_distance_from_uniform": distance_from_uniform.scalar(),
@@ -184,7 +184,9 @@ def estimate_mixture_weights(
 
     # we're not actually going to use the trainer for very much but it holds hooks and sets up contexts
     with trainer:
-        tagged_mixture = domain_tagged_mixture(data_sources, sampling_weights, domain_to_index, key=data_key)
+        tagged_mixture: MixtureDataset = domain_tagged_mixture(
+            data_sources, sampling_weights, domain_to_index, key=data_key
+        )
         state = load_checkpoint_or_initialize(
             DoremiState.init,
             trainer.checkpoint_path,
@@ -263,7 +265,7 @@ def _prepare_ref_model(ref, trainer):
 
 
 def domain_tagged_mixture(
-    data_sources: dict[str, AsyncDataset[T]],
+    data_sources: Mapping[str, AsyncDataset[T]],
     weights: dict[str, float],
     domain_to_index: dict[str, int],
     *,

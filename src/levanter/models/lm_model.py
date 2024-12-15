@@ -1,16 +1,18 @@
 import abc
+from dataclasses import dataclass
 from typing import Generic, Optional, Type, TypeVar
 
 import draccus
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jax.random import PRNGKey
 
 import haliax as hax
-from haliax import Axis, NamedArray
+from haliax import Axis, NamedArray, NamedOrNumeric
 
 from levanter.models.attention import AttentionMask
-from levanter.models.loss import next_token_loss
+from levanter.models.loss import maybe_fused_next_token_loss
 
 
 LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
@@ -24,7 +26,11 @@ class LmExample(eqx.Module):
 
     @staticmethod
     def causal(
-        tokens: hax.NamedArray, *, loss_mask: Optional[hax.NamedArray] = None, ignore_id: Optional[int] = None
+        tokens: hax.NamedArray,
+        *,
+        loss_mask: Optional[hax.NamedArray] = None,
+        ignore_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -44,10 +50,47 @@ class LmExample(eqx.Module):
             loss_mask = loss_mask * ignore_mask
 
         attn_mask = AttentionMask.causal()
+
+        if eos_id is not None:
+            # the next token after an eos token is in a new segment
+            eos_mask = hax.roll(tokens, 1, Pos) == eos_id
+            # first token is always in segment 0
+            eos_mask = eos_mask.at[Pos, 0].set(False).astype(jnp.int32)
+            segment_ids = hax.cumsum(eos_mask, axis=Pos)
+            attn_mask = attn_mask.with_segment_ids(segment_ids)
+
+        return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
+
+    @staticmethod
+    def from_prompt_and_completion(
+        Pos,
+        tokens: hax.NamedArray,
+        prompt_length: NamedOrNumeric,
+        *,
+        ignore_id: Optional[int] = None,
+        all_causal: bool = True,
+    ) -> "LmExample":
+        # mask out the prompt tokens
+        loss_mask = hax.arange(Pos) >= prompt_length - 1
+        # don't predict the padding
+        if ignore_id is not None:
+            targets = hax.roll(tokens, -1, Pos)
+            loss_mask = loss_mask & (targets != ignore_id)
+
+        # don't predict the last token
+        loss_mask = loss_mask & (1 - hax.nn.one_hot(-1, Pos, dtype=jax.numpy.bool_))
+
+        if all_causal:
+            attn_mask = AttentionMask.causal()
+        else:
+            # causal just for the completion part. We don't have a special structured mask for this, so we just
+            raise NotImplementedError("Not implemented yet")
+
         return LmExample(tokens=tokens, loss_mask=loss_mask, attn_mask=attn_mask)
 
 
 # TODO: for some reason, mypy doesn't like the discover_packages_path argument?
+@dataclass(frozen=True)
 class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_path="levanter.models"):  # type: ignore
     @property
     @abc.abstractmethod
@@ -69,7 +112,7 @@ class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_
     def Embed(self) -> Axis:
         pass
 
-    cross_entropy_block_size: Optional[int] = 64000
+    cross_entropy_block_size: Optional[int] = None
     """
     The block size for computing cross-entropy loss. This is the number of tokens that are processed together
     in a single block. This can be adjusted to fit within memory constraints. It's deliberately set to a large
@@ -83,7 +126,7 @@ class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_
         return self.model_type.init(Vocab, self, key=key)  # type: ignore
 
 
-class LmHeadModel(Generic[LmConfigT], abc.ABC):
+class LmHeadModel(eqx.Module, Generic[LmConfigT]):
     """
     Superclass for models with a language modeling head.
     """
@@ -188,7 +231,7 @@ def compute_next_token_loss(
     """
     activations = model.activations(example.tokens, example.attn_mask, key=key)
 
-    loss = next_token_loss(
+    loss = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,

@@ -10,7 +10,7 @@ from haliax import NamedArray
 from haliax.nn import cross_entropy_loss_and_log_normalizers
 
 
-def next_token_loss(
+def maybe_fused_next_token_loss(
     Pos: hax.AxisSelector,
     Embed: hax.AxisSelector,
     Vocab: hax.AxisSelector,
@@ -46,6 +46,15 @@ def next_token_loss(
     Pos = pred_embeddings.resolve_axis(Pos)
     Vocab = pred_lm_head.resolve_axis(Vocab)
 
+    if block_size is None:
+        # Full softmax computation
+        logits = hax.dot(pred_embeddings, pred_lm_head, axis=Embed)
+        if dtype is not None:
+            logits = logits.astype(dtype)
+
+        # Shift target tokens to predict the next token
+        return next_token_loss(Pos, Vocab, logits, true_ids, loss_mask, reduction, reduction_axis, logsumexp_weight)
+
     # Shift target tokens to predict the next token
     target_y = hax.roll(true_ids, -1, Pos)
 
@@ -55,20 +64,6 @@ def next_token_loss(
         loss_mask = loss_mask * not_last_loss_mask
     else:
         loss_mask = not_last_loss_mask
-
-    if block_size is None:
-        # Full softmax computation
-        logits = hax.dot(pred_embeddings, pred_lm_head, axis=Embed, preferred_element_type=dtype)
-        target_y_full = hax.nn.one_hot(target_y, Vocab, dtype=pred_embeddings.dtype)
-        return cross_entropy_and_logsumexp_penalty(
-            logits,
-            Vocab,
-            target_y_full,
-            reduction=reduction,
-            reduction_axis=reduction_axis,
-            where=loss_mask,
-            logsumexp_weight=logsumexp_weight,
-        )
 
     # Compute the loss with optional block-wise processing
     return fused_cross_entropy_loss_and_logsumexp_penalty(
@@ -86,9 +81,57 @@ def next_token_loss(
     )
 
 
+def next_token_loss(
+    Pos: hax.AxisSelector,
+    Vocab: hax.AxisSelector,
+    logits: NamedArray,
+    true_ids: NamedArray,
+    loss_mask: Optional[NamedArray] = None,
+    reduction: Optional[hax.ReductionFunction] = hax.mean,
+    reduction_axis: Optional[hax.AxisSelection] = None,
+    logsumexp_weight: Optional[float] = None,
+):
+    """
+    Compute the next token loss with optional logsumexp penalty.
+
+    Args:
+        Pos: axis selector for the position axis
+        Vocab: axis selector for the vocabulary axis
+        logits: predicted logits
+        true_ids: true token IDs (not shifted)
+        loss_mask: mask to apply to the loss
+        reduction: reduction function or None to disable reduction
+        reduction_axis: axis to apply reduction. None means all axes
+        logsumexp_weight: weight for the logsumexp penalty
+    Returns:
+        NamedArray: computed loss
+    """
+    Pos = logits.resolve_axis(Pos)
+
+    target_y = hax.roll(true_ids, -1, Pos)
+    target_y_full = hax.nn.one_hot(target_y, Vocab, dtype=logits.dtype)
+
+    # Create a mask that excludes the last token
+    not_last_loss_mask = 1 - hax.nn.one_hot(-1, Pos, dtype=jnp.float32)  # type: ignore
+    if loss_mask is not None:
+        loss_mask = loss_mask * not_last_loss_mask
+    else:
+        loss_mask = not_last_loss_mask
+
+    return cross_entropy_and_logsumexp_penalty(
+        Vocab=Vocab,
+        pred_y=logits,
+        target_y=target_y_full,
+        reduction=reduction,
+        reduction_axis=reduction_axis,
+        where=loss_mask,
+        logsumexp_weight=logsumexp_weight,
+    )
+
+
 def cross_entropy_and_logsumexp_penalty(
-    pred_y: NamedArray,
     Vocab: hax.Axis,
+    pred_y: NamedArray,
     target_y: NamedArray,
     *,
     reduction: Optional[hax.ReductionFunction] = hax.mean,
@@ -261,9 +304,10 @@ def _block_cross_entropy_forward(
 
         # Materialize the logits for the current block
         lm_head_b = pred_lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
-        logits_b = hax.dot(
-            pred_embeddings, lm_head_b, axis=Contract, preferred_element_type=dtype
-        )  # [Batch, Seq, Block]
+        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Seq, Block]
+
+        if dtype is not None:
+            logits_b = logits_b.astype(dtype)
 
         # Update max and logsumexp
         max_logit = hax.maximum(max_logit_prev, hax.max(logits_b, axis=Block))  # [Batch, Seq]
@@ -278,7 +322,7 @@ def _block_cross_entropy_forward(
         # Update sumV. This is actually unnecessary if we're using one-hot targets
         # sV = sV_prev + hax.sum(target_y_b, axis=Label.name)
 
-        loss += hax.dot(logits_b, target_y_b, axis=Block, preferred_element_type=dtype)  # [Batch, Seq]
+        loss += hax.dot(logits_b, target_y_b, axis=Block)  # [Batch, Seq]
 
         return loss, logsumexp, max_logit  # , sV
 
@@ -351,7 +395,7 @@ def _block_cross_entropy_backward(
     num_blocks = vocab_size // block_size
 
     grad_embeddings = hax.zeros(pred_embeddings.axes, dtype=pred_embeddings.dtype)
-    grad_lm_head = hax.zeros(pred_lm_head.axes, dtype=pred_embeddings.dtype)
+    grad_lm_head = hax.zeros(pred_lm_head.axes, dtype=pred_lm_head.dtype)
 
     def process_block(block_idx, acc, current_block_size):
         """
@@ -372,14 +416,15 @@ def _block_cross_entropy_backward(
 
         # Materialize the logits for the current block
         lm_head_b = pred_lm_head[Label, hax.dslice(start, Block)]  # [Contract, Block]
-        logits_b = hax.dot(
-            pred_embeddings, lm_head_b, axis=Contract, preferred_element_type=dtype
-        )  # [Batch, Seq, Block]
+        logits_b = hax.dot(pred_embeddings, lm_head_b, axis=Contract)  # [Batch, Seq, Block]
 
         # Materialize the target for the current block (one-hot)
         target_y_block = _block_one_hot(Block, start, labels_y, logits_b.dtype)  # [Batch, Seq, Block]
 
         # materialize the softmax for the current block
+        if dtype is not None:
+            logits_b = logits_b.astype(dtype)
+
         p_b = hax.exp(logits_b - log_z)  # [Batch, Seq, Block]
 
         delta_b = p_b - target_y_block
