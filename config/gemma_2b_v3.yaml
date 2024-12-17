@@ -8,15 +8,15 @@ initialize_from_hf: "google/gemma-2b"
 use_hf_model_config: true
 trainer:
   checkpointer:
-    base_path: "gs://wasabi-tpu-training/gemma-2b/"
+    base_path: "gs://fineweb-edu-v4/gemma-2b/"
   tracker:
     type: wandb
-    project: "levanter"
-    tags: ["openwebtext", "gemma"]
+    project: "indic-llama"
+    tags: ["fineweb", "gemma"]
 
   mp: p=bfloat16,c=bfloat16
   train_batch_size: 256  # set for v4-128 TPU
-  num_train_steps: 100000
+  num_train_steps: 200000
   steps_per_eval: 50
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
