@@ -293,15 +293,27 @@ def launch_job(
     foreground: bool,
     version: Optional[str] = None,
 ):
-    start_tpu_vm_queued_resources(
-        tpu_name=tpu_name,
-        tpu_type=tpu_type,
-        queued=queued, 
-        capacity_type=capacity_type,
-        version=version,
-        zone=zone,
-        node_count=node_count,
-    )
+    if not queued:
+        start_tpu_vm_queued_resources(
+            tpu_name=tpu_name,
+            tpu_type=tpu_type,
+            queued=queued, 
+            capacity_type=capacity_type,
+            version=version,
+            zone=zone,
+            node_count=node_count,
+        )
+    
+    else:
+        start_tpu_vm(
+            tpu_name=tpu_name,
+            tpu_type=tpu_type,
+            queued=queued, 
+            capacity_type=capacity_type,
+            version=version,
+            zone=zone,
+            node_count=node_count,
+        )
 
     # We don't technically need to setup on every run, but if we are working on a
     # stale VM or a VM from e.g. spin-up-vm.sh, this ensures things always work.
