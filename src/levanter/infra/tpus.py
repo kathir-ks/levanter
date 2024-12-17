@@ -111,7 +111,7 @@ def start_tpu_vm_queued_resources(tpu_name, *, tpu_type, queued, capacity_type, 
     # ensure alpha is enabled
     # run_command("gcloud", "components", "install", "alpha", "--quiet")
     # sudo apt-get install google-cloud-cli
-    run_command("sudo", "apt-get", "install", "google-cloud-cli")
+    # run_command("sudo", "apt-get", "install", "google-cloud-cli")
     if version is None:
         version = "tpu-ubuntu2204-base"
     if queued:

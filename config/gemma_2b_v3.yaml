@@ -1,0 +1,27 @@
+data:
+  id: KathirKs/fineweb-edu-hindi
+  cache_dir: "gs://fineweb-edu-v3/fineweb-edu-hindi"
+  tokenizer: "google/gemma-2b"
+model:
+  type: gemma
+initialize_from_hf: "google/gemma-2b"
+use_hf_model_config: true
+trainer:
+  checkpointer:
+    base_path: "gs://wasabi-tpu-training/gemma-2b/"
+  tracker:
+    type: wandb
+    project: "levanter"
+    tags: ["openwebtext", "gemma"]
+
+  mp: p=bfloat16,c=bfloat16
+  train_batch_size: 256  # set for v4-128 TPU
+  num_train_steps: 100000
+  steps_per_eval: 50
+  tensor_parallel_axes: ["mlp", "heads"]
+  fsdp_axis: "embed"
+  batch_axis: "batch"
+optimizer:
+  learning_rate: 1.2E-5  # set low for fine-tuning
+  weight_decay: 0.1
+  min_lr_ratio: 0.1
