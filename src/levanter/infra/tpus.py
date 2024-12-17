@@ -183,7 +183,90 @@ def start_tpu_vm_queued_resources(tpu_name, *, tpu_type, queued, capacity_type, 
         time.sleep(60)
         waited += 1
 
-        tpu_stat = describe_tpu_queued_resource(tpu_name, zone)
+        tpu_stat = describe_tpu_vm(tpu_name, zone)
+        assert tpu_stat is not None, f"{tpu_name} creation failed."
+
+        match tpu_stat["state"]["state"]:
+            case "ACTIVE":
+                break
+            case "FAILED":
+                raise RuntimeError(
+                    f"{tpu_name} creation failed: {tpu_stat['state']['failedData']['error']['message']}"
+                )
+            case _:
+                print(f"Status is {tpu_stat['state']['state']}. Waited {waited} minutes...")
+
+def start_tpu_vm(tpu_name, *, tpu_type, queued, capacity_type, version, zone, node_count):
+    
+    if version is None:
+        version = "tpu-ubuntu2204-base"
+
+    tpu_stat = describe_tpu_vm(tpu_name, zone)
+    
+    if tpu_stat['state'] == 'READY':
+        return
+    if tpu_stat is not None:
+        if tpu_stat["state"]["state"] in ["FAILED", "SUSPENDED"]:
+            print("TPU suspended,  deleting...", file=sys.stderr)
+
+            run_command(
+                "gcloud",
+                "compute",
+                "tpus",
+                "tpu-vm",
+                "delete",
+                tpu_name,
+                "--quiet",
+                f"--zone={zone}",
+                "--force",
+            )
+        else:
+            print(f"TPU {tpu_name} already exists and is in state {tpu_stat['state']['state']}.", file=sys.stderr)
+            return
+
+    print(f"Creating new TPU {tpu_name} in {zone} of type {tpu_type}...", file=sys.stderr)
+    command = [
+        "gcloud",
+        "compute",
+        "tpus",
+        "tpu-vm",
+        "create",
+        tpu_name,
+        f"--accelerator-type={tpu_type}",
+        f"--zone={zone}",
+        "--quiet",
+    ]
+    if version is not None:
+        command.append(f"--version={version}")
+    if capacity_type in ["preemptible", "best-effort"]:
+        command.append("--best-effort")
+    elif capacity_type == "reserved":
+        command.append("--reserved")
+    elif capacity_type == "spot":
+        command.append("--spot")
+    elif capacity_type == "on-demand" or capacity_type is None:
+        pass
+    else:
+        raise ValueError(f"Unknown capacity type: {capacity_type}")
+
+    if node_count == 1:
+        command.append(f"--node-id={tpu_name}")
+    else:
+        command.append(f"--node-count={node_count}")
+
+    run_command(*command)
+
+    # wait for queued resource to complete
+    print("Checking TPU creation status every minute...")
+    waited = 0
+
+    while True:
+        run_command(*command)
+
+        time.sleep(60)
+        waited += 1
+
+        tpu_stat = describe_tpu_vm(tpu_name, zone)
         assert tpu_stat is not None, f"{tpu_name} creation failed."
 
         match tpu_stat["state"]["state"]:
