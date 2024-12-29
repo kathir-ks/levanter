@@ -84,19 +84,19 @@ class TrainArgs:
     trainer: TrainerConfig
 
     max_tune_length: int = 2048  # maximum length of the input to the model during tuning
-    data: str = "tatsu-lab/alpaca"  # Path to the training data, or huggingface dataset name.
+    data: str = "iamshnoo/alpaca-cleaned-hindi"  # Path to the training data, or huggingface dataset name.
     data_cache_dir: str = "cache/"  # Path to cache the tokenized data. can be gcs
     prompts: Optional[Dict[str, str] | str] = None  # Path to the prompts file or a dict of prompts. can be gcs
     mask_inputs: bool = True  # if True, mask out the input and prompt for loss calculation
 
-    model_name_or_path: str = "meta-llama/Llama-2-7b-hf"
+    model_name_or_path: str = ""
     trust_remote_code: bool = False  # Trust remote code when loading from HuggingFace checkpoints.
 
     model_cache_dir: Optional[str] = None  # Path to cache the model. must be local.
 
-    hf_save_path: Optional[str] = "alpaca_hf_ckpts"  # Path to save the HuggingFace checkpoint, can be gcs
+    hf_save_path: Optional[str] = ""  # Path to save the HuggingFace checkpoint, can be gcs
     hf_upload: Union[bool, str] = False  # Name of the HuggingFace repo to upload to (if any).
-    hf_save_steps: int = 1000  # How often to save the HuggingFace checkpoint.
+    hf_save_steps: int = 300  # How often to save the HuggingFace checkpoint.
 
 
 def _get_data_source(path_or_id):
