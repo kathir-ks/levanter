@@ -137,7 +137,7 @@ def mk_dataset(config: TrainArgs, tokenizer: transformers.PreTrainedTokenizerBas
 
         source_lens = [len(s) for s in sources_tokenized["input_ids"]]
 
-        return {
+        return {    
             "input_ids": examples_tokenized["input_ids"],
             "source_lens": source_lens,
         }

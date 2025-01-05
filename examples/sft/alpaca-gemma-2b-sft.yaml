@@ -1,4 +1,7 @@
 model_name_or_path: KathirKs/gemma-2b-hindi
+tokenizer: KathirKs/gemma-2b-hindi
+
+initialize_from_hf: KathirKs/gemma-2b-hindi
 
 trainer:
   checkpointer:
@@ -21,16 +24,15 @@ optimizer:
   weight_decay: 0.0
 
 supervised_data:
-  hf_dataset_name: "iamshnoo/alpaca-cleaned-hindi"
-  hf_dataset_split: "train"
+  id: "iamshnoo/alpaca-cleaned-hindi"
   input_field: "instruction"
   output_field: "output"
   cache_dir: "gs://fineweb-edu-v4/alpaca-cleaned-hindi"
 
-max_tune_length: 8192
-trust_remote_code: false
-model_cache_dir: null
+max_seq_len: 8192
 
 hf_save_path: "sft_hf_ckpts"
 hf_upload: KathirKs/gemma-2b-hindi-sft-alpaca
 hf_save_steps: 500
+
+epoch: 3
