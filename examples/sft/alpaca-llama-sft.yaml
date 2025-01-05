@@ -36,7 +36,7 @@ optimizer:
 # Supervised data configuration
 supervised_data:
   cache_dir: "gs://levanter-checkpoints/marin/sft_cache/alpaca-olmo"
-  input_field: "instruction"
+  input_field: "instruction"  
   output_field: "output"
   hf_dataset_name: "tatsu-lab/alpaca"  # Changed from id
   hf_dataset_split: "train"

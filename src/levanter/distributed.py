@@ -204,84 +204,39 @@ def auto_ray_cluster(
         return host, port
 
     if address is None:
-        # Ray automatically looks at RAY_ADDRESS. We don't want to use our defaulting logic if that is set
         if os.getenv("RAY_ADDRESS") is not None:
             address = os.getenv("RAY_ADDRESS")
             logger.info("Auto-discovered ray address using RAY_ADDRESS: %s", address)
         else:
             coord_address = getattr(distributed.global_state, "coordinator_address", None)
-
             if coord_address is None:
                 logger.info("No auto-discovered ray address found. Using ray.init('local').")
-                address = "local"
+                address = "local"   
             else:
                 logger.info(f"Auto-discovered ray address using JAX coordinator address: {coord_address}")
                 host, port = _munge_address_port(coord_address)
-
                 ray_port = _choose_port(port + 240)
                 address = f"{host}:{ray_port}"
 
-                # Explicitly setting the number of CPUs on ray init stops init errors
-                num_cpus = logical_cpu_core_count()
-
-                if _is_local_leader():
-                    # it used to be that if we were coordinator, we were also process 0
-                    # this is no longer the case, so instead we need to check if we are the coordinator
-                    # and if so, start the head
-                    if _is_this_machine(host):
-                        logger.info(f"Starting ray head on port {ray_port}. We are process the coordinator {host}.")
-                        logger.info(f"Starting ray head with num_cpus set to {num_cpus}.")
-                        ret = os.system(
-                            f"ray start --head --port {ray_port} --num-cpus {num_cpus} --dashboard-host=0.0.0.0"
-                        )
-                        if ret != 0:
-                            if not fail_if_cluster_already_initialized:
-                                # see if we can connect to the head
-                                logger.warning(
-                                    f"Failed to start ray head with exit code {ret}. Checking if we can connect to"
-                                    " the head..."
-                                )
-                                ret = os.system("ray status")
-                                if ret != 0:
-                                    raise RuntimeError(f"Failed to start ray head with exit code {ret}")
-                                else:
-                                    logger.info(f"Ray head already running on port {ray_port}. Connecting to it.")
-                            else:
-                                raise RuntimeError(f"Failed to start ray head with exit code {ret}")
-                        else:
-                            logger.info(f"Successfully started ray head on port {ray_port}.")
-
-                        # install an atexit handler to kill the head when we exit
-                        atexit.register(lambda: os.system("ray stop -g 10 --force &> /dev/null"))
-                    elif start_workers:
-                        logger.info(
-                            f"Starting ray worker and connecting to {address}. We are process {jax.process_index()}."
-                        )
-                        logger.info(f"Starting ray worker with num_cpus set to {num_cpus}.")
-                        ret = os.system(f"ray start --address {address} --num-cpus {num_cpus}")
-                        if ret != 0:
-                            raise RuntimeError(f"Failed to start ray head with exit code {ret}")
-                        else:
-                            logger.info(f"Successfully started ray worker and connected to {address}.")
-
-    logger.info(f"ray.init(address={repr(address)}, namespace={repr(namespace)}, **{repr(kwargs)})")
-    # Ray has retry logic, but it doesn't seem to work super well, so we retry manually
-    for i in range(0, 5):
-        try:
-            ray.init(address=address, namespace=namespace, **kwargs)
-            break
-        except Exception as e:
-            if i == 4:
-                raise e
+    logger.info(f"Attempting to start or connect to Ray at {address}")
+    num_cpus = logical_cpu_core_count()
+    command = f"ray start --address {address} --num-cpus {num_cpus}" if start_workers else f"ray start --head --port {ray_port} --num-cpus {num_cpus} --dashboard-host=0.0.0.0"
+    logger.info(f"Executing command: {command}")
+    ret = os.system(command)
+    if ret != 0:
+        logger.error(f"Failed to execute command with exit code {ret}")
+        if not fail_if_cluster_already_initialized:
+            logger.warning("Checking if we can connect to the head...")
+            ret = os.system("ray status")
+            if ret != 0:
+                raise RuntimeError(f"Failed to start ray head with exit code {ret}")
             else:
-                logger.warning(f"Failed to initialize ray with address {address}. Retrying...")
-                continue
+                logger.info("Ray head already running. Connecting to it.")
+        else:
+            raise RuntimeError(f"Failed to start ray head with exit code {ret}")
+    else:
+        logger.info("Successfully started or connected to Ray.")
 
-    def do_shutdown():
-        logger.info("Shutting down ray...")
-        ray.shutdown()
-
-    atexit.register(do_shutdown)
     _already_initialized = True
 
 
