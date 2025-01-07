@@ -676,6 +676,9 @@ class TrainerConfig:
         levanter.utils.logging.init_logging(self.log_dir, f"{id}.log")
         _initialize_global_tracker(self.tracker, id)
 
+        if jax.process_index() == 0:
+            self.ray.initialize(start_workers=False)
+            
         self.ray.initialize()
 
         if self.require_accelerator is None:

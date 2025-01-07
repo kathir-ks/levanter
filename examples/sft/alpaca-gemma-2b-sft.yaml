@@ -18,6 +18,8 @@ trainer:
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
+  
+dataset_type: "huggingface"
 
 optimizer:
   learning_rate: 2e-5

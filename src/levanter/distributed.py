@@ -223,7 +223,7 @@ def auto_ray_cluster(
     command = f"ray start --address {address} --num-cpus {num_cpus}" if start_workers else f"ray start --head --port {ray_port} --num-cpus {num_cpus} --dashboard-host=0.0.0.0"
     logger.info(f"Executing command: {command}")
     ret = os.system(command)
-    if ret != 0:
+    if ret != 0: 
         logger.error(f"Failed to execute command with exit code {ret}")
         if not fail_if_cluster_already_initialized:
             logger.warning("Checking if we can connect to the head...")
@@ -290,7 +290,7 @@ class DistributedConfig:
 
 @dataclass
 class RayConfig:
-    address: Optional[str] = None
+    address: Optional[str] = None   
     start_workers: bool = True
     auto_start_cluster: bool = True
 

@@ -19,6 +19,8 @@ trainer:
   fsdp_axis: "embed"
   batch_axis: "batch"
 
+dataset_type: "huggingface"
+
 optimizer:
   learning_rate: 2e-5
   weight_decay: 0.0

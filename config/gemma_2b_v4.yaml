@@ -1,6 +1,18 @@
 data:
-  id: KathirKs/fineweb-edu-hindi
-  cache_dir: "gs://fineweb-edu-v4/fineweb-edu-hindi"
+  configs:
+    fineweb-edu-hindi:
+      id: KathirKs/fineweb-edu
+    fineweb-edu-english:
+      id: HuggingFaceFW/fineweb-edu
+      name: sample-100BT
+    culturax:
+      id: uonlp/CulturaX
+      name: hi
+  train_weights:
+    fineweb-edu-hindi: 0.8
+    fineweb-edu-english: 0.2
+    culturax: 0.05
+  cache_dir: "gs://fineweb-edu-us/fineweb-edu-hindi"
   tokenizer: "google/gemma-2b"
 model:
   type: gemma
@@ -8,7 +20,7 @@ initialize_from_hf: "google/gemma-2b"
 use_hf_model_config: true
 trainer:
   checkpointer:
-    base_path: "gs://fineweb-edu-v4/gemma-2b/"
+    base_path: "gs://fineweb-edu-us/gemma-2b/"
   tracker:
     type: wandb
     project: "indic-llama"
