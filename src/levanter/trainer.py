@@ -675,9 +675,6 @@ class TrainerConfig:
         id = self._maybe_set_id()
         levanter.utils.logging.init_logging(self.log_dir, f"{id}.log")
         _initialize_global_tracker(self.tracker, id)
-
-        if jax.process_index() == 0:
-            self.ray.initialize(start_workers=False)
             
         self.ray.initialize()
 

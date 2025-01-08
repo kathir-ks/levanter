@@ -296,6 +296,9 @@ class RayConfig:
 
     def initialize(self):
         if self.auto_start_cluster:
+            print(jax.process_index())
+            if(jax.process_index() == 0):
+                auto_ray_cluster(address=self.address, start_workers=False)
             auto_ray_cluster(address=self.address, start_workers=self.start_workers)
 
 
