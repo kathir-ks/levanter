@@ -37,10 +37,9 @@ def main():
     cli.add_arg(parser, config, ["--github_token"], type=str)
     cli.add_arg(parser, config, ["--extra_context"], type=Path, required=False, default=None)
     cli.add_arg(parser, config, ["--queued"], type=bool, required=False, default=True)
+    cli.add_arg(parser, config, ["--artifact_repo_region"], type=str, required=False, default="us-central1")
 
-    parser.add_argument(
-        "-e", "--env", action="append", nargs=2, metavar=("KEY", "VALUE"), default=list(config.get("env", {}).items())
-    )
+    parser.add_argument("-e", "--env", action="append", nargs=2, metavar=("KEY", "VALUE"))
     parser.add_argument("command", nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
@@ -110,7 +109,7 @@ def main():
         full_image_id = docker.push_to_gcp(
             local_id=local_id,
             project_id=project,
-            region=region,
+            region=args.artifact_repo_region,
             repository=docker_repository,
         )
     else:

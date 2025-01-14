@@ -218,6 +218,7 @@ def push_to_github(local_id, github_user, github_token=None):
 
 def push_to_gcp(local_id, project_id, region, repository) -> str:
     """Pushes a local Docker image to Artifact Registry."""
+    
     configure_gcp_docker(project_id, region, repository)
 
     artifact_repo = f"{region}-docker.pkg.dev/{project_id}/{repository}"

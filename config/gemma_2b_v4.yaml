@@ -41,3 +41,4 @@ optimizer:
   warmup: 0.01
   decay: 0.99
   rewarmup: 0.01
+  cycles: 3
