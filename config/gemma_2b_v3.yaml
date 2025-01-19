@@ -1,27 +1,44 @@
 data:
-  id: KathirKs/fineweb-edu-hindi
-  cache_dir: "gs://fineweb-edu-v3/fineweb-edu-hindi"
+  configs:
+    fineweb-edu-hindi:
+      id: KathirKs/fineweb-edu-hindi
+    fineweb-edu-english:
+      id: HuggingFaceFW/fineweb-edu
+      name: sample-100BT
+    culturax:
+      id: uonlp/CulturaX
+      name: hi
+  train_weights:
+    fineweb-edu-hindi: 0.8
+    fineweb-edu-english: 0.2
+    culturax: 0.05
+  cache_dir: "gs://fineweb-edu-europe/fineweb-edu-hindi"
   tokenizer: "google/gemma-2b"
+  shuffle: True
 model:
   type: gemma
 initialize_from_hf: "google/gemma-2b"
 use_hf_model_config: true
 trainer:
   checkpointer:
-    base_path: "gs://fineweb-edu-v3/gemma-2b/"
+    base_path: "gs://fineweb-edu-europe/gemma-2b/"
   tracker:
     type: wandb
     project: "indic-llama"
     tags: ["fineweb", "gemma"]
 
   mp: p=bfloat16,c=bfloat16
-  train_batch_size: 256  # set for v4-128 TPU
+  train_batch_size: 16  # set for v4-128 TPU
   num_train_steps: 200000
   steps_per_eval: 50
   tensor_parallel_axes: ["mlp", "heads"]
   fsdp_axis: "embed"
   batch_axis: "batch"
 optimizer:
-  learning_rate: 1.2E-5  # set low for fine-tuning
+  learning_rate: 2E-4  # set low for fine-tuning
   weight_decay: 0.1
-  min_lr_ratio: 0.1
+  min_lr_ratio: 0.00225
+  warmup: 0.01
+  decay: 0.99
+  rewarmup: 0.01
+  cycles: 3
