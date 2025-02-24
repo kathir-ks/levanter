@@ -969,6 +969,7 @@ def _core_writer_task(
 
 
 def _clean_up_temp_caches(path):
+    logger.info(f"Cleaning up temporary cache at {path}")
     if fsspec_exists(path):
         for i in range(10):
             # this is crashy for some reason
@@ -1237,7 +1238,7 @@ async def _extend_cache_with_other_cache(
             source_offsets = source_array.offsets[1 : source_num_rows + 1][ts.d[:].translate_to[0]]
             source_offsets = _virtual_offset(source_offsets, data_offset)
 
-            delay = 1
+            delay = 4
             while True:
                 try:
                     async with ts.Transaction() as txn:
@@ -1253,7 +1254,7 @@ async def _extend_cache_with_other_cache(
                         logger.info("Rate limit exceeded. Retrying.")
                         await asyncio.sleep(delay)
                         delay *= 2
-                        if delay > 60:
+                        if delay > 120:
                             raise
 
             futures.append(offset_future)
@@ -1396,7 +1397,6 @@ def _tokenize_one_shard_group(
                 logger.debug(
                     f"Processed {rows_this_shard} rows. Wrote {this_batch_size} rows to {shard_name}. ({nice_bytes})"
                 )
-                # print(f"Processed {rows_this_shard} rows. Wrote {this_batch_size} rows to {shard_name}. ({nice_bytes})", flush=True)
                 this_batch_size = 0
                 prepared_batch = None
 
@@ -1420,7 +1420,7 @@ def _tokenize_one_shard_group(
     if not force_unfinalized:
         writer.finish()
 
-    logger.debug(f"Finished processing {len(shards)} shards. Wrote {total_rows} rows.")
+    logger.info(f"Finished processing {len(shards)} shards. Wrote {total_rows} rows.")
 
     return writer.ledger
 

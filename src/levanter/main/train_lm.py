@@ -121,7 +121,6 @@ def main(config: TrainLmConfig):
         parameter_axis_mapping = trainer.parameter_axis_mapping
 
         # some axes we need
-        Batch = config.trainer.TrainBatch
         EvalBatch = config.trainer.EvalBatch
         Pos = config.model.Pos
         KeyPos = config.model.KeyPos
@@ -136,10 +135,13 @@ def main(config: TrainLmConfig):
 
         # TODO: fix this
         tagged_eval_datasets: list = config.data.tagged_eval_sets(Pos.size)
-        # TokenSeqDataset is config.data.train_set(Pos.size, key=data_key)
+
+        train_sets = config.data.train_set(
+            Pos.size, key=data_key, epochs=config.epoch, batch_schedule=config.trainer.batch_schedule
+        )
 
         train_dataset = CausalLmDataset(
-            config.data.train_set(Pos.size, key=data_key, epochs=config.epoch),
+            train_sets,
             Pos,
             KeyPos,
             ignore_index=config.data.ignore_token_id,
@@ -244,7 +246,7 @@ def main(config: TrainLmConfig):
         flops_per_token = config.model.flops_per_token(vocab_size)
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
-            callbacks.log_performance_stats(Pos.size, trainer.config.train_batch_size, flops_per_example), every=1
+            callbacks.log_performance_stats(Pos.size, trainer.config.batch_schedule, flops_per_example), every=1
         )
         # trainer.add_hook(callbacks.GradWatchCallback(include_histogram=True), every=5)
 
@@ -282,7 +284,7 @@ def main(config: TrainLmConfig):
             logprobs = hax.roll(logprobs, 1, Pos)
             return logprobs.rearrange((EvalBatch, Pos)).array
 
-        train_loader = trainer.data_loader(train_dataset, Batch)
+        train_loader = trainer.data_loader(train_dataset)
         if seek_dataloader:
             train_loader = train_loader.iter_from_step(state.step)
         else:
