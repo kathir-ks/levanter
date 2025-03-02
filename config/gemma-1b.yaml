@@ -1,0 +1,42 @@
+data:
+  configs:
+    fineweb-edu-hindi:
+      id: KathirKs/fineweb-edu-hindi
+  train_weights:
+    fineweb-edu-hindi: 1.0
+  cache_dir: "gs://fineweb-edu-us/custom_tokenized/fineweb-edu-hindi/"
+  tokenizer: "KathirKs/hindi_tokenizer"
+
+model:
+  type: gemma
+  seq_len: 4096
+  hidden_dim: 1536
+  intermediate_dim: 8192
+  vocab_size: 32000
+  num_layers: 16
+  num_heads: 12
+  num_kv_heads: 1
+  head_dim: 128
+  use_flash_attention: True
+  flash_attention_block_size: 512
+
+trainer:
+  tracker:
+   type: wandb 
+   project: "fineweb"
+
+  mp: p=f32,c=bfloat16
+  train_batch_size: 4096
+  num_train_steps: 750000  # 3,000,000,000,000 / 4,000,000 = 750,000
+  steps_per_eval: 1000
+  tensor_parallel_axes: ["mlp", "heads"]
+  fsdp_axis: "embed"
+  batch_axis: "batch"
+  checkpointer:
+    base_path: "gs://fineweb-edu-us/llama-1b/"
+
+optimizer:
+  learning_rate: 4E-4
+  weight_decay: 0.02
+  min_lr_ratio: 0.1
+  warmup: 0.02

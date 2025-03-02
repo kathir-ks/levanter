@@ -48,7 +48,7 @@ def list_tpus(zone):
         subprocess.check_output(
             [
                 "gcloud",
-                "alpha",
+                # "alpha", // remove alpha
                 "compute",
                 "tpus",
                 "queued-resources",
@@ -67,7 +67,7 @@ def describe_tpu_queued_resource(tpu_name, zone):
             subprocess.check_output(
                 [
                     "gcloud",
-                    "alpha",
+                    # "alpha", // remove alpha
                     "compute",
                     "tpus",
                     "queued-resources",
@@ -90,7 +90,6 @@ def describe_tpu_vm(tpu_name, zone):
             subprocess.check_output(
                 [
                     "gcloud",
-                    "alpha",
                     "compute",
                     "tpus",
                     "tpu-vm",
@@ -198,15 +197,17 @@ def launch_job(
     env: dict[str, str],
     foreground: bool,
     version: Optional[str] = None,
+    vm_created: Optional[bool] = True
 ):
-    start_tpu_vm_queued_resources(
-        tpu_name=tpu_name,
-        tpu_type=tpu_type,
-        capacity_type=capacity_type,
-        version=version,
-        zone=zone,
-        node_count=node_count,
-    )
+    if not vm_created:
+        start_tpu_vm_queued_resources(
+            tpu_name=tpu_name,
+            tpu_type=tpu_type,
+            capacity_type=capacity_type,
+            version=version,
+            zone=zone,
+            node_count=node_count,
+        )
 
     # We don't technically need to setup on every run, but if we are working on a
     # stale VM or a VM from e.g. spin-up-vm.sh, this ensures things always work.
@@ -260,7 +261,7 @@ def tpu_ssh(tpu_name, zone, node_count, *args, ignore_failure=False):
 
         return run_command(
             "gcloud",
-            "alpha",
+            # "alpha", // alpha removed 
             "compute",
             "tpus",
             "tpu-vm",
@@ -284,7 +285,7 @@ def _tpu_ssh_multislice(tpu_name, zone, node_count, *args, ignore_failure=False)
             executor.submit(
                 run_command,
                 "gcloud",
-                "alpha",
+                # "alpha", // remove alpha 
                 "compute",
                 "tpus",
                 "tpu-vm",
