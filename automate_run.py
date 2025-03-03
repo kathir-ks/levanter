@@ -10,12 +10,15 @@ import datetime
 
 logger = None
 
+
+# Try running all the commands with sudo 
 def create_tpu_vm(tpu_name, tpu_type, zone):
     tpu_created = False
 
     while not tpu_created:
         tpu_create_issue = subprocess.run(
             [
+                "sudo", 
                 "gcloud",
                 "compute",
                 "tpus", 
@@ -35,6 +38,9 @@ def create_tpu_vm(tpu_name, tpu_type, zone):
             tpu_created = True
             logger.info(f'{datetime.datetime.now()} - TPU Create Succesfully')
             return tpu_create_issue.stdout
+        elif 'ALREADY_EXISTS' in tpu_create_issue.stderr:
+            tpu_created = True
+            logger.info(f'{datetime.datetime.now()} - TPU Already Exists')
         else: 
             logger.error(f'{datetime.datetime.now()}-TPU CREATION ERROR: {tpu_create_issue.stderr}')
             time.sleep(120)
@@ -44,6 +50,7 @@ def describe_tpu_vm(tpu_name, zone):
     
     return subprocess.run(
             [
+                "sudo", 
                 "gcloud",
                 "compute",
                 "tpus",
@@ -61,6 +68,7 @@ def describe_tpu_vm(tpu_name, zone):
 def delete_tpu_vm(tpu_name, zone):
     return subprocess.run(
         [
+            "sudo",
             "gcloud", 
             "compute", 
             "tpus", 
@@ -115,6 +123,8 @@ def parse_tpu_status(tpu_describe_query_output):
             return 'PREEMPTED'
         elif 'DELETED' in tpu_describe_query_output.stdout:
             return 'DELETED'
+        elif 'DELETING' in tpu_describe_query_output.stdout:
+            return 'DELETING'
         elif 'CREATING' in tpu_describe_query_output.stdout:
             return 'CREATING'
         elif 'READY' in tpu_describe_query_output.stdout:
@@ -200,8 +210,8 @@ if __name__ == "__main__":
         
         if tpu_status == 'READY':
             if inference_running:
-                logger.info(f'{datetime.datetime.now()}- TPU RUNNING AS WELL AS YOUR INFERENCE...')
-                time.sleep(120)
+                logger.info(f'{datetime.datetime.now()} - TPU RUNNING AS WELL AS YOUR INFERENCE...')
+                time.sleep(180)
                 continue
             else:
                 logger.info(f'{datetime.datetime.now()} - Resuming Inference')
@@ -215,12 +225,16 @@ if __name__ == "__main__":
         elif tpu_status == 'DELETING' or tpu_status == 'PREEMPTING':
             inference_running = False
             logger.warning(f'{datetime.datetime.now()} - TPU STATUS: {tpu_status}')
-            time.sleep(120)
+            time.sleep(180)
         
         elif tpu_status == 'PREEMPTED':
             inference_running = False
-            delete_tpu_vm(tpu_name, zone)
             logger.info(f'{datetime.datetime.now()} - DELETING TPU')
+            delete_request = delete_tpu_vm(tpu_name, zone)
+            if delete_request.returncode == 0:
+                logger.info(f'{datetime.datetime.now()} - Deleted Successfully {delete_request.stdout}')
+            else:
+                logger.error(f'{datetime.datetime.now()} - Error in deleting tpu {delete_request.stderr}')
             time.sleep(30)
 
         elif tpu_status == 'NOTFOUND' or tpu_status == "DELETED":
@@ -229,9 +243,9 @@ if __name__ == "__main__":
             logger.info(f'{datetime.datetime.now()} - Resuming Inference')
             inference_ssh = run_inference(tpu_name, tpu_type, zone, config, trainer_id, load_checkpoint_path)
             if inference_ssh.returncode == 0:
-                logger.info(f'{datetime.datetime.now()} - Inference Started Successfully')
+                logger.info(f'{datetime.datetime.now()} - Inference Started Successfully {inference_ssh.stdout}')
                 inference_running = True
             else:
                 logger.error(f'{datetime.datetime.now()} - Error in inference: {inference_ssh.stderr}')
-            time.sleep(120)
+                time.sleep(120)
         
