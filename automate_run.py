@@ -8,6 +8,8 @@ import json
 import logging
 import datetime
 
+from typing import Optional
+
 logger = None
 
 
@@ -28,7 +30,8 @@ def create_tpu_vm(tpu_name, tpu_type, zone):
                 f"--zone={zone}",
                 f"--accelerator-type={tpu_type}",
                 f"--version=tpu-ubuntu2204-base",
-                f"--preemptible"
+                f"--preemptible",
+                "--quiet"
             ], 
             capture_output=True, 
             text=True
@@ -75,13 +78,14 @@ def delete_tpu_vm(tpu_name, zone):
             "tpu-vm", 
             "delete",
             f"{tpu_name}", 
-            f"--zone={zone}"
+            f"--zone={zone}", 
+            "--quiet"
         ], 
         capture_output=True, 
         text=True
     )
 
-def run_inference(tpu_name, tpu_type, zone, config, trainer_id, load_checkpoint_path):
+def resume_inference(tpu_name, tpu_type, zone, config, trainer_id, load_checkpoint_path):
     return subprocess.run(
         [
             "sudo", 
@@ -108,6 +112,55 @@ def run_inference(tpu_name, tpu_type, zone, config, trainer_id, load_checkpoint_
         capture_output=True, 
         text=True
     )
+
+def start_inference(tpu_name, tpu_type, zone, config):
+    return subprocess.run(
+        [
+            "sudo", 
+            "python3", 
+            "infra/launch.py", 
+            "--tpu_name", 
+            f"{tpu_name}", 
+            "--tpu_type", 
+            f"{tpu_type}", 
+            "--zone", 
+            f"{zone}", 
+            "--", 
+            "python3", 
+            "src/levanter/main/train_lm.py", 
+            "--config_path",
+            f"{config}",
+        ], 
+        capture_output=True, 
+        text=True
+    )
+
+def run_inference(tpu_name, tpu_type, zone, config, trainer_id : Optional[str] = None , load_checkpoint_path : Optional[str] = None):
+    if trainer_id is not None and load_checkpoint_path is not None:
+        return resume_inference(tpu_name, tpu_type, zone, config, trainer_id, load_checkpoint_path)
+    else:
+        return start_inference(tpu_name, tpu_type, zone, config)
+
+def find_checkpoint_path(fs, checkpoint_path):
+    checkpoints = fs.ls(checkpoint_path)
+
+    if len(checkpoints) == 0:
+        logger.warn("No checkpoint found")
+        return None, None
+    elif len(checkpoints) > 1:
+        logger.error("multiple checkpoints found")
+        return None, None
+
+    trainer_id = checkpoints[0].split('/')[-1]
+
+    checkpoints_by_step = fs.ls(f'{checkpoint_path}/{trainer_id}')
+    checkpoint_steps = [checkpoint.split('/')[-1] for checkpoint in checkpoints_by_step]
+    steps = [int(step.split('-')[-1]) for step in checkpoint_steps]
+    steps.sort(reverse=True)
+
+    latest_step = steps[-1]
+    load_checkpoint_path = f'{checkpoint_path}/{trainer_id}/step-{latest_step}'
+    return trainer_id, load_checkpoint_path
 
 def parse_tpu_status(tpu_describe_query_output):
     # TODO: Add enum for tpu status
@@ -157,6 +210,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config_file = args.config_file
+    checkpoint_path = None
 
     with open(config_file, 'r') as f:
         inference_args = json.load(f)
@@ -166,8 +220,9 @@ if __name__ == "__main__":
     tpu_type = inference_args['tpu_type']
     zone = inference_args['zone']
     config = inference_args['config']
-    checkpoint_path = inference_args['checkpoint_path']
     base_bucket_path = inference_args['base_bucket_path']
+    if 'checkpoint_path' in inference_args:
+        checkpoint_path = inference_args['checkpoint_path']
 
     logger = logging.getLogger(__name__)
     logging.basicConfig(filename=f"{tpu_name}_inference.log", encoding='utf-8', level=logging.DEBUG)
@@ -175,26 +230,11 @@ if __name__ == "__main__":
     fs: AbstractFileSystem = fsspec.core.url_to_fs(checkpoint_path)[0]
 
     # print(checkpoint_path)
-    checkpoints = fs.ls(checkpoint_path)
-
-    if len(checkpoints) == 0:
-        print("No checkpoint found")
-        exit(0)
-    elif len(checkpoints) > 1:
-        print("multiple checkpoints found")
-        exit(0)
-
-    trainer_id = checkpoints[0].split('/')[-1]
-
-    checkpoints_by_step = fs.ls(f'{checkpoint_path}/{trainer_id}')
-    checkpoint_steps = [checkpoint.split('/')[-1] for checkpoint in checkpoints_by_step]
-    steps = [int(step.split('-')[-1]) for step in checkpoint_steps]
-    steps.sort(reverse=True)
-
-    latest_step = steps[-1]
-    load_checkpoint_path = f'{checkpoint_path}/{trainer_id}/step-{latest_step}'
-
-    logger.info(f'load_checkpoint_path: {load_checkpoint_path}')
+    if checkpoint_path is not None:     
+        trainer_id, load_checkpoint_path = find_checkpoint_path(fs, checkpoint_path)
+        if trainer_id is not None:
+            resume_training = True
+            logger.info(f'Last checkpoints found at load_checkpoint_path: {load_checkpoint_path}')
 
     # TODO: Add inference running status enum
     inference_running = False
@@ -248,4 +288,3 @@ if __name__ == "__main__":
             else:
                 logger.error(f'{datetime.datetime.now()} - Error in inference: {inference_ssh.stderr}')
                 time.sleep(120)
-        
