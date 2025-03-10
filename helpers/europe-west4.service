@@ -1,0 +1,14 @@
+[Unit]
+Description=v4-128 training
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/kathirks_gc/levanter/automate_run.py --config_file /home/kathirks_gc/levanter/v4_config.json
+WorkingDirectory=/home/kathirks_gc/levanter
+Restart=always
+User=kathirks_gc
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target
