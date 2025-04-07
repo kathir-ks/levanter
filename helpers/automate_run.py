@@ -176,7 +176,7 @@ def find_checkpoint_path(fs, checkpoint_path):
     steps = [int(step.split('-')[-1]) for step in checkpoint_steps]
     steps.sort(reverse=True)
 
-    latest_step = steps[-1]
+    latest_step = steps[0]
     load_checkpoint_path = f'{checkpoint_path}/{trainer_id}/step-{latest_step}'
     return trainer_id, load_checkpoint_path
 
