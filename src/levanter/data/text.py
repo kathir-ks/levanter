@@ -10,7 +10,21 @@ import warnings
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import chain
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple, TypeAlias, TypeVar, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    Union,
+)
 
 import datasets
 import equinox as eqx
@@ -608,6 +622,12 @@ class LMTaskConfig(abc.ABC):
     shuffle: bool | int = False
     """whether to shuffle the dataset. True means shuffle the whole dataset, False means don't shuffle.
     If you want to shuffle in eras, set this to the era length"""
+    permutation_type: Literal["feistel", "linear"] | None = None
+    """
+    Type of permutation to use for shuffle.
+
+    If None, defaults to linear, but this will change in the future since Feistel is better.
+    """
 
     @cached_property
     def the_tokenizer(self) -> HfTokenizer:
@@ -626,6 +646,17 @@ class LMTaskConfig(abc.ABC):
         key: PRNGKeyArray,
         epochs: Optional[int] = None,
     ) -> AsyncDataset[LmExample]:
+        pass
+
+    @abc.abstractmethod
+    def train_sets(
+        self,
+        Pos: Axis,
+        monitors: Union[bool, List[MetricsMonitor]] = True,
+        *,
+        key: PRNGKeyArray,
+        epochs: Optional[int] = None,
+    ) -> Mapping[str, AsyncDataset[LmExample]]:
         pass
 
     @abc.abstractmethod
@@ -1047,12 +1078,32 @@ class LMDatasetConfig(LMDatasetSourceConfig, LMTaskConfig):
             logger.info("Wrapping dataset in epoch dataset")
             ds = EpochDataset(ds, max_epochs=epochs)
 
+        perm_type = self.permutation_type
+        if perm_type is None:
+            logger.warning(
+                "Defaulting to linear permutation for shuffling. This will change to Feistel in the future."
+            )
+            perm_type = "linear"
+
         if self.shuffle is True:
-            ds = ds.shuffle(key)
+            ds = ds.shuffle(key, perm_type=perm_type)
         elif isinstance(self.shuffle, int) and self.shuffle > 0:
-            ds = ds.era_shuffle(self.shuffle, key=key)
+            ds = ds.era_shuffle(self.shuffle, key=key, perm_type=perm_type)
 
         return CausalLmDataset(ds, Pos, ignore_index=self.ignore_token_id, eos_id=self.the_tokenizer.eos_token_id)  # type: ignore
+
+    def train_sets(
+        self,
+        Pos: Axis,
+        monitors: Union[bool, List[MetricsMonitor]] = True,
+        *,
+        key: PRNGKeyArray,
+        epochs: Optional[int] = None,
+    ) -> Mapping[str, AsyncDataset[LmExample]]:
+        return {
+            # we don't care about BatchSchedule in this class
+            "": self.train_set(Pos, BatchSchedule(32), monitors, key=key, epochs=epochs)
+        }
 
     def validation_set(
         self,
@@ -1229,34 +1280,62 @@ class LMMixtureDatasetConfig(LMTaskConfig):
         key: PRNGKeyArray,
         epochs: Optional[int] = None,
     ) -> AsyncDataset[LmExample]:
-        doc_caches = self.build_caches("train", monitors=monitors)
-        token_datasets = {name: TokenSeqDataset(cache, Pos.size) for name, cache in doc_caches.items()}
+        mix_key, shuffle_key = jax.random.split(key)
+        causal_datasets = self.train_sets(Pos, monitors, key=shuffle_key, epochs=epochs)
 
+        weights = self.train_weights
+        if isinstance(weights, Sequence):
+            weights = rescale_mixture_schedule_for_batch_schedule(weights, batch_schedule)
+
+        mixture = MixtureDataset(
+            datasets=causal_datasets,
+            weights=weights,
+            stop_strategy=self.stop_strategy,
+            key=mix_key,
+            block_size=self.mixture_block_size,
+        )
+
+        return mixture
+
+    def train_sets(
+        self,
+        Pos: Axis,
+        monitors: Union[bool, List[MetricsMonitor]] = True,
+        *,
+        epochs: Optional[int] = None,
+        key: PRNGKeyArray,
+    ) -> Mapping[str, AsyncDataset[LmExample]]:
+        doc_caches = self.build_caches("train", monitors=monitors)
+        token_datasets = self._token_seq_datasets(Pos, doc_caches)
         if epochs:
             raise ValueError("Epochs are not supported for mixture datasets")
 
         if key is None:
             key = jax.random.PRNGKey(0)
 
-        mix_key, shuffle_key = jax.random.split(key)
-
         # We shuffle the components and not the overall mixture because this lets us preserve
         # the "stable batch" property of the mixture dataset.
+        perm_type = self.permutation_type
+        if perm_type is None and self.shuffle is not False:
+            logger.warning(
+                "Defaulting to linear permutation for shuffling. This will change to Feistel in the future."
+            )
+            perm_type = "linear"
+
         def shuffle_ds(ds, key):
             if self.shuffle is True:
-                ds = ds.shuffle(key)
-            elif isinstance(self.shuffle, int):
-                ds = ds.era_shuffle(self.shuffle, key=key)
+                ds = ds.shuffle(key, perm_type=perm_type)
+            elif isinstance(self.shuffle, int) and self.shuffle > 0:
+                ds = ds.era_shuffle(self.shuffle, key=key, perm_type=perm_type)
 
             return ds
 
         if self.shuffle:
             out_token_datasets = {}
-            key_iter = key_iterator(shuffle_key)
+            key_iter = key_iterator(key)
             for name, ds in token_datasets.items():
                 out_token_datasets[name] = shuffle_ds(ds, next(key_iter))
             token_datasets = out_token_datasets
-
         if (
             self.experiment_budget is not None and self.target_budget is not None
         ) and self.experiment_budget > self.target_budget:
@@ -1273,7 +1352,6 @@ class LMMixtureDatasetConfig(LMTaskConfig):
                 simulated_length_of_dataset = int(true_length_of_dataset * simulated_data_ratio)
                 sliced_token_datasets[name] = ds.slice_dataset(end_index=simulated_length_of_dataset)
             token_datasets = sliced_token_datasets
-
         causal_datasets = {
             name: CausalLmDataset(
                 ds,
@@ -1283,26 +1361,17 @@ class LMMixtureDatasetConfig(LMTaskConfig):
             )
             for name, ds in token_datasets.items()
         }
+        return causal_datasets
 
-        weights = self.train_weights
-        if isinstance(weights, Sequence):
-            weights = rescale_mixture_schedule_for_batch_schedule(weights, batch_schedule)
-
-        mixture = MixtureDataset(
-            datasets=causal_datasets,
-            weights=weights,
-            stop_strategy=self.stop_strategy,
-            key=mix_key,
-            block_size=self.mixture_block_size,
-        )
-
-        return mixture
+    def _token_seq_datasets(self, Pos, doc_caches):
+        token_datasets = {name: TokenSeqDataset(cache, Pos.size) for name, cache in doc_caches.items()}
+        return token_datasets
 
     def validation_sets(
         self, Pos: Axis, monitors: Union[bool, List[MetricsMonitor]] = True
     ) -> Mapping[str, AsyncDataset[LmExample]]:
         doc_caches = self.build_caches("validation", monitors=monitors)
-        token_datasets = {name: TokenSeqDataset(cache, Pos.size) for name, cache in doc_caches.items()}
+        token_datasets = self._token_seq_datasets(Pos, doc_caches)
         return {
             name: CausalLmDataset(
                 ds,

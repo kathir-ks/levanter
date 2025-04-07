@@ -13,6 +13,7 @@ from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
+import levanter.callbacks
 import levanter.eval
 import levanter.eval_harness
 from levanter import callbacks
@@ -21,7 +22,7 @@ from levanter.compat.hf_checkpoints import HFCompatConfig, save_hf_checkpoint_ca
 from levanter.data.text import LMDatasetConfig, LMMixtureDatasetConfig, SupervisedSourceConfig, mk_supervised_datasets
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.gpt2 import Gpt2Config
-from levanter.models.lm_model import LmConfig, compute_next_token_loss
+from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_next_token_loss
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
@@ -54,10 +55,16 @@ class TrainLmConfig:
 
     data_seed: Optional[int] = None  # if provided, will override the data seed from the trainer
     initialize_from_checkpoint_path: Optional[str] = None
-    # if provided, will initialize from this checkpoint, used for llama style data mixture
+    """
+    If provided, will initialize from this checkpoint, used for llama style ablation. This resets the data loader.
+    Note that this differs from --trainer.initialize_from, which does not reset the data loader.
+    """
     epoch: int = 0
     eval_harness: Optional[LmEvalHarnessConfig] = None
     eval_harness_steps: int = 10000
+
+    # TODO: really need to add callback framework
+    log_entropy: bool = False
 
 
 def main(config: TrainLmConfig):
@@ -208,7 +215,7 @@ def main(config: TrainLmConfig):
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.batch_schedule, flops_per_example), every=1
         )
-        # trainer.add_hook(callbacks.GradWatchCallback(include_histogram=True), every=5)
+        # trainer.add_hook(callbacks.GradWatchCallback(include_histograms=True), every=5)
 
         if config.hf_save_path is not None:
             # bit gross to reach this far into the config, but it's fine
@@ -231,23 +238,37 @@ def main(config: TrainLmConfig):
                 every=config.eval_harness_steps,
             )
 
-        # visualize log probs
         @named_jit(
             in_axis_resources=parameter_axis_mapping,
             axis_resources=compute_axis_mapping,
             out_axis_resources=compute_axis_mapping,
         )
-        def compute_log_probs(model, example):
+        def compute_logits(model: LmHeadModel, example: LmExample):
             model = trainer.mp.cast_to_compute(model)
-            logprobs = model.compute_loss(example, key=None, reduction=None)
-            # roll forward to get the loss for each predicted token
-            logprobs = hax.roll(logprobs, 1, Pos)
-            return logprobs.rearrange((EvalBatch, Pos)).array
+            activations = model.activations(example.tokens, key=None, attn_mask=example.attn_mask)
+            head = model.get_lm_head()
+            logits = hax.dot(activations, head, axis=model.Embed)
+            return logits
+
+        if config.log_entropy:
+            for name, dataset in config.data.validation_sets(Pos).items():
+                trainer.add_hook(
+                    levanter.analysis.cb_compute_entropies(
+                        compute_logits,
+                        Vocab,
+                        dataset,
+                        prefix=os.path.join("analysis", name) if name else "analysis",
+                        batch_size=EvalBatch.size,
+                        mapping=compute_axis_mapping,
+                    ),
+                    every=config.trainer.steps_per_eval,
+                )
 
         train_loader = trainer.data_loader(train_dataset)
         if seek_dataloader:
             train_loader = train_loader.iter_from_step(state.step)
         else:
+            logger.warn("Not seeking dataloader")
             train_loader = iter(train_loader)
 
         ## OK, actually run training!
