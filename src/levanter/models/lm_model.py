@@ -10,7 +10,7 @@ from jaxtyping import PRNGKeyArray
 import haliax as hax
 from haliax import Axis, NamedArray, NamedOrNumeric
 
-from levanter.models.attention import AttentionMask
+from levanter.layers.attention import AttentionMask
 from levanter.models.loss import maybe_fused_next_token_loss
 
 
@@ -31,6 +31,7 @@ class LmExample(eqx.Module):
         ignore_id: Optional[int] = None,
         eos_id: Optional[int] = None,
         segment_ids: Optional[hax.NamedArray] = None,
+        sliding_window: int | None = None,
     ) -> "LmExample":
         if tokens.ndim != 1:
             raise ValueError("tokens must be a 1D array")
@@ -54,7 +55,7 @@ class LmExample(eqx.Module):
 
         loss_mask = loss_mask.astype(jnp.int32)
 
-        attn_mask = AttentionMask.causal()
+        attn_mask = AttentionMask.causal(sliding_window=sliding_window)
 
         if eos_id is not None and segment_ids is None:
             # the next token after an eos token is in a new segment
@@ -76,9 +77,10 @@ class LmExample(eqx.Module):
         *,
         ignore_id: Optional[int] = None,
         all_causal: bool = True,
+        sliding_window: int | None = None,
     ) -> "LmExample":
         if all_causal:
-            attn_mask = AttentionMask.causal()
+            attn_mask = AttentionMask.causal(sliding_window=sliding_window)
         else:
             # causal just for the completion part. We don't have a special structured mask for this, so we just
             raise NotImplementedError("Not implemented yet")
@@ -138,6 +140,9 @@ class LmConfig(draccus.PluginRegistry, abc.ABC, Generic[LmT], discover_packages_
     def flops_per_token(self, vocab_size: int) -> Optional[float]:
         return None
 
+    def total_trainable_params(self) -> Optional[float]:
+        return None
+
     def build(self, Vocab: Axis, *, key: PRNGKeyArray) -> "LmT":
         return self.model_type.init(Vocab, self, key=key)  # type: ignore
 
@@ -175,7 +180,12 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
         pass
 
     def __call__(
-        self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
     ) -> NamedArray:
         """
         Compute the logits for the next token in a sequence.
@@ -188,14 +198,24 @@ class LmHeadModel(eqx.Module, Generic[LmConfigT]):
             NamedArray: logits with shape [..., Pos, Vocab]
 
         """
-        x = self.activations(input_ids, attn_mask, key=key)
+        try:
+            x = self.activations(input_ids, attn_mask, key=key, pos_ids=pos_ids)
+        except TypeError:
+            # For backward compatibility with models that don't yet support pos_ids
+            x = self.activations(input_ids, attn_mask, key=key)
+
         lm_logits = hax.dot(x, self.get_lm_head(), axis=self.Embed)
 
         return lm_logits
 
     @abc.abstractmethod
     def activations(
-        self, input_ids: NamedArray, attn_mask: Optional[AttentionMask | NamedArray] = None, *, key=None
+        self,
+        input_ids: NamedArray,
+        attn_mask: Optional[AttentionMask | NamedArray] = None,
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
     ) -> NamedArray:
         """
         Compute the activations for the next token in a sequence.
@@ -239,6 +259,7 @@ def compute_next_token_loss(
     reduction_axis: Optional[hax.AxisSelection] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[jnp.dtype] = jnp.float32,
+    logit_soft_cap: Optional[float] = None,
 ) -> jnp.ndarray | NamedArray:
     """
     Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
@@ -246,6 +267,10 @@ def compute_next_token_loss(
     reduced, and the result is a named array with axes (*batch axes, sequence_length).
     """
     activations = model.activations(example.tokens, example.attn_mask, key=key)
+
+    aux_loss = 0
+    if isinstance(activations, tuple):
+        activations, aux_loss = activations
 
     loss = maybe_fused_next_token_loss(
         model.Pos,
@@ -260,6 +285,7 @@ def compute_next_token_loss(
         logsumexp_weight=logsumexp_weight,
         dtype=loss_dtype,
         block_size=model.config.cross_entropy_block_size,
+        logit_soft_cap=logit_soft_cap,
     )
 
-    return loss
+    return loss + aux_loss

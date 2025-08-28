@@ -1,23 +1,31 @@
 import functools
 import math
 import warnings
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Union, overload
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.random as jrandom
 from jax.experimental.pallas.ops.tpu.splash_attention import SegmentIds
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
 from jaxtyping import PRNGKeyArray
 
 import haliax
+import haliax as hax
+import haliax.nn as hnn
 from haliax import Axis, AxisSelection, AxisSelector, NamedArray, axis_name
-from haliax.jax_utils import named_call
+from haliax.jax_utils import maybe_rng_split, named_call
 from haliax.nn.attention import causal_mask, combine_masks_and, combine_masks_or
+from haliax.nn.normalization import LayerNormBase
 from haliax.partitioning import pspec_for_axis
 from haliax.types import PrecisionLike
+
+from .normalization import LayerNormConfigBase
+from .rotary import RotaryEmbeddings, RotaryEmbeddingsConfig
 
 
 class AttentionBackend(Enum):
@@ -55,8 +63,10 @@ def dot_product_attention(
     flash_block_size: Optional[int] = None,
     dropout: float = 0.0,
     *,
+    logits_soft_cap: float | None = None,
+    scaling_factor: float | None = None,
     inference: bool = True,
-    prng: Optional[PRNGKeyArray] = None,
+    prng: PRNGKeyArray | None = None,
 ):
     """
     This method is similar to [haliax.nn.attention.dot_product_attention][] but it can use different backends for
@@ -79,10 +89,14 @@ def dot_product_attention(
         attention_dtype: Optional dtype to use for attention
         precision: PrecisionLike for dot product. See precision argument to jax.lax.dot_general
         use_flash: whether to use flash attention
+        attn_backend: AttentionBackend to use. If None, will use the default for the accelerator.
         flash_block_size: block size for flash attention. If None, will use an appropriate default
         dropout: dropout rate
         inference: whether to use inference mode
         prng: PRNGKeyArray for dropout
+        scaling_factor: If not None, query will be multiplied by this value before attention.
+             default is 1/sqrt(HeadSize.size)
+        logits_soft_cap: If not None, the attention logits will be soft_capped with tanh(logits / logits_soft_cap) * logits_soft_cap.
     Returns:
         NamedArray of shape (value.axes - KPos + QPos)
     """
@@ -115,6 +129,9 @@ def dot_product_attention(
     else:
         was_default = False
 
+    if scaling_factor is None:
+        scaling_factor = 1 / math.sqrt(query.resolve_axis(Key).size)
+
     match attn_backend:
         case AttentionBackend.NVTE:
             attention_out = _try_te_attention(
@@ -128,11 +145,13 @@ def dot_product_attention(
                 bias,
                 dropout,
                 inference,
-                force_te=not was_default,
                 prng=prng,
                 attention_dtype=attention_dtype,
                 precision=precision,
                 flash_block_size=flash_block_size,
+                force_te=not was_default,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
             )
         case AttentionBackend.SPLASH:
             attention_out = _try_tpu_splash_attention(
@@ -151,6 +170,8 @@ def dot_product_attention(
                 attention_dtype=attention_dtype,
                 precision=precision,
                 block_size=flash_block_size,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
             )
         case AttentionBackend.VANILLA:
             attention_out = simple_attention_with_dropout(
@@ -167,6 +188,8 @@ def dot_product_attention(
                 attention_dtype,
                 precision,
                 prng=prng,
+                scaling_factor=scaling_factor,
+                logits_soft_cap=logits_soft_cap,
             )
         case _:
             attention_out = None
@@ -192,7 +215,94 @@ def dot_product_attention(
             key=prng,
             dtype=attention_dtype,
             precision=precision,
+            scaling_factor=scaling_factor,
+            logits_soft_cap=logits_soft_cap,
         )
+
+
+def dot_product_attention_with_sink(
+    QPos: AxisSelector,
+    KPos: AxisSelection,
+    Key: AxisSelector,
+    query: NamedArray,
+    key: NamedArray,
+    value: NamedArray,
+    attn_sink: NamedArray,
+    mask: Optional[Union["AttentionMask", NamedArray]] = None,
+    bias: Optional[NamedArray] = None,
+    attention_dtype: Optional[jnp.dtype] = None,
+    precision: PrecisionLike = None,
+    use_flash: Optional[bool] = None,
+    attn_backend: Optional[AttentionBackend] = None,
+    flash_block_size: Optional[int] = None,
+    dropout: float = 0.0,
+    *,
+    logits_soft_cap: float | None = None,
+    scaling_factor: float | None = None,
+    inference: bool = True,
+    prng: PRNGKeyArray | None = None,
+):
+    """Dot-product attention variant with a learned sink term per head.
+
+    The sink is implemented by appending a dummy key/value of zeros and
+    inserting the sink logit via the bias term at the final key position.
+    """
+
+    QPos = query.resolve_axis(QPos)
+    KPos = key.resolve_axis(KPos)
+    Key = query.resolve_axis(Key)
+
+    KPos1 = KPos.resize(1)
+    KPosPlus = KPos.resize(KPos.size + 1)
+
+    zero_key_axes = tuple(KPos1 if ax == KPos else ax for ax in key.axes)
+    zero_key = hax.zeros(zero_key_axes, dtype=key.dtype)
+    key = hax.concatenate(KPosPlus, [key, zero_key])
+
+    zero_val_axes = tuple(KPos1 if ax == KPos else ax for ax in value.axes)
+    zero_val = hax.zeros(zero_val_axes, dtype=value.dtype)
+    value = hax.concatenate(KPosPlus, [value, zero_val])
+
+    m = materialize_mask(mask, QPos, KPos)
+    if m is not None:
+        sink_mask_axes = tuple(KPos1 if ax == KPos else ax for ax in m.axes)
+        sink_mask = hax.ones(sink_mask_axes, dtype=m.dtype)
+        m = hax.concatenate(KPosPlus, [m, sink_mask])
+
+    bias_axes_prefix = tuple(ax for ax in query.axes if ax != Key)
+    sink_bias = attn_sink
+    for ax in bias_axes_prefix:
+        if ax not in sink_bias.axes:
+            sink_bias = sink_bias.broadcast_axis(ax)
+    sink_bias = sink_bias.broadcast_axis(KPos1)
+
+    if bias is not None:
+        bias = hax.concatenate(KPosPlus, [bias, sink_bias])
+    else:
+        zero_bias_axes = bias_axes_prefix + (KPos,)
+        zero_bias = hax.zeros(zero_bias_axes, dtype=sink_bias.dtype)
+        bias = hax.concatenate(KPosPlus, [zero_bias, sink_bias])
+
+    return dot_product_attention(
+        QPos,
+        KPosPlus,
+        Key,
+        query,
+        key,
+        value,
+        m,
+        bias,
+        attention_dtype,
+        precision,
+        use_flash,
+        attn_backend,
+        flash_block_size,
+        dropout,
+        logits_soft_cap=logits_soft_cap,
+        scaling_factor=scaling_factor,
+        inference=inference,
+        prng=prng,
+    )
 
 
 def simple_attention_with_dropout(
@@ -210,15 +320,41 @@ def simple_attention_with_dropout(
     precision: PrecisionLike = None,
     *,
     prng: Optional[PRNGKeyArray] = None,
+    scaling_factor: float | None = None,
+    logits_soft_cap: Optional[float] = None,
 ):
     QPos = query.resolve_axis(QPos)
     KPos = key.resolve_axis(KPos)
     m = materialize_mask(mask, QPos, KPos)
-    weights = haliax.nn.attention.dot_product_attention_weights(
-        Key, KPos, query, key, mask=m, bias=bias, attention_dtype=attention_dtype, precision=precision
-    )
-    weights = haliax.nn.dropout(weights, dropout, key=prng, inference=inference)
-    return haliax.dot(weights, value, axis=KPos)
+    orig_dtype = query.dtype
+
+    if scaling_factor is None:
+        scaling_factor = 1.0 / jnp.sqrt(query.axis_size(Key))
+
+    query = query * scaling_factor
+
+    if attention_dtype is not None:
+        query = query.astype(attention_dtype)
+        key = key.astype(attention_dtype)
+
+    weights = haliax.dot(query, key, precision=precision, axis=Key)
+
+    if bias is not None:
+        weights = weights + bias
+
+    if logits_soft_cap is not None:
+        weights = hax.tanh(weights / logits_soft_cap) * logits_soft_cap
+
+    if m is not None:
+        weights = haliax.where(m, weights, -1e9)
+
+    weights = haliax.nn.softmax(weights, axis=KPos)
+
+    weights = weights.astype(orig_dtype)
+
+    out = haliax.nn.dropout(weights, dropout, key=prng, inference=inference)
+
+    return haliax.dot(out, value, axis=KPos)
 
 
 def _try_te_attention(
@@ -238,6 +374,8 @@ def _try_te_attention(
     precision: PrecisionLike = None,
     flash_block_size: Optional[int] = None,
     force_te: bool,
+    scaling_factor: float,
+    logits_soft_cap: Optional[float] = None,
 ):
     try:
         return _te_flash_attention(
@@ -247,14 +385,16 @@ def _try_te_attention(
             query,
             key,
             value,
-            block_size=flash_block_size,
             mask=mask,
             bias=bias,
             dropout=dropout,
             inference=inference,
-            precision=precision,
             prng=prng,
             attention_dtype=attention_dtype,
+            precision=precision,
+            block_size=flash_block_size,
+            scaling_factor=scaling_factor,
+            logits_soft_cap=logits_soft_cap,
         )
     except ImportError as e:
         if "transformer_engine" not in str(e):
@@ -310,9 +450,17 @@ def _te_flash_attention(
     attention_dtype: Optional[jnp.dtype] = None,
     precision: PrecisionLike = None,
     block_size: Optional[int] = None,
+    scaling_factor: float,
+    logits_soft_cap: Optional[float] = None,
 ):
     from transformer_engine.jax.attention import fused_attn  # noqa: F401
     from transformer_engine.jax.attention import AttnBiasType, AttnMaskType, QKVLayout  # noqa: F401
+
+    if logits_soft_cap is not None:
+        raise NotImplementedError(
+            "logits_soft_cap is not supported for NVTE fused attention. "
+            "Please use the JAX reference implementation or ask NVIDIA..."
+        )
 
     attention_dtype = attention_dtype or query.dtype
     query = query.astype(attention_dtype)
@@ -349,7 +497,6 @@ def _te_flash_attention(
     # Mask is generated by transformer engine based on AttnMaskType
     attn_mask_type, fused_attn_mask = _te_materialize_mask(KPos, QPos, B, mask)
 
-    scaling_factor = 1 / math.sqrt(D)
     is_training = not inference
 
     # TODO: bias type is probably also configurable
@@ -414,9 +561,9 @@ def _te_materialize_mask(KPos, QPos, batch_size, mask):
 
             fused_attn_mask = mask.materialize(QPos, KPos)
 
-            assert (
-                fused_attn_mask is not None
-            ), "If AttentionMask is causal, the materialized array should never be None. Something is wrong."
+            assert fused_attn_mask is not None, (
+                "If AttentionMask is causal, the materialized array should never be None. Something is wrong."
+            )
 
             fused_attn_mask = fused_attn_mask.array
             fused_attn_mask = jnp.dstack([fused_attn_mask] * batch_size)
@@ -555,6 +702,18 @@ def _materialize_segment_mask(segment_ids, QPos, KPos, q_slice, k_slice) -> Name
     return q_segment_ids.broadcast_axis(sub_KPos) == kv_segment_ids
 
 
+def _materialize_sliding_window_mask(
+    window: int, QPos: Axis, KPos: Axis, q_slice: haliax.dslice, k_slice: haliax.dslice
+) -> NamedArray:
+    """Materialize a causal sliding window mask."""
+    sub_q = QPos.resize(q_slice.size)
+    sub_k = KPos.resize(k_slice.size)
+    q_pos = hax.arange(sub_q) + q_slice.start
+    k_pos = hax.arange(sub_k) + k_slice.start
+    diff = q_pos.broadcast_axis(sub_k) - k_pos.broadcast_axis(sub_q)
+    return (diff >= 0) & (diff < window)
+
+
 class AttentionMask(eqx.Module):
     """
 
@@ -584,6 +743,7 @@ class AttentionMask(eqx.Module):
     is_causal: bool = eqx.field(static=True)
     explicit_mask: Optional[NamedArray] = None
     segment_ids: Optional[NamedArray] = None
+    sliding_window: Optional[int] = eqx.field(default=None, static=True)
     # CF https://github.com/jax-ml/jax/blob/47858c4ac2fd4757a3b6fc5bb2981b71a71f00c2/jax/experimental/pallas/ops/tpu/flash_attention.py#L34
     # TODO: add prefixlm
     # cf https://github.com/google-research/t5x/blob/51a99bff8696c373cc03918707ada1e98cbca407/t5x/examples/decoder_only/layers.py#L978
@@ -612,6 +772,12 @@ class AttentionMask(eqx.Module):
 
         mask = combine_masks_and(causal, explicit)
 
+        if self.sliding_window is not None:
+            sw_mask = _materialize_sliding_window_mask(
+                self.sliding_window, QPos, KPos, q_slice=q_slice, k_slice=k_slice
+            )
+            mask = combine_masks_and(mask, sw_mask)
+
         if self.segment_ids is not None:
             segment_mask = _materialize_segment_mask(self.segment_ids, QPos, KPos, q_slice, k_slice)
             mask = combine_masks_and(mask, segment_mask)
@@ -619,28 +785,68 @@ class AttentionMask(eqx.Module):
         return mask
 
     @staticmethod
-    def causal() -> "AttentionMask":
-        return AttentionMask(is_causal=True)
+    def causal(sliding_window: Optional[int] = None) -> "AttentionMask":
+        """Create a causal AttentionMask.
+
+        Args:
+            sliding_window: If provided, restrict each query position to attend only to keys within
+                ``sliding_window`` previous positions.
+        """
+        return AttentionMask(is_causal=True, sliding_window=sliding_window)
 
     @staticmethod
     def explicit(mask: NamedArray) -> "AttentionMask":
         return AttentionMask(is_causal=False, explicit_mask=mask)
 
     def with_segment_ids(self, segment_ids: NamedArray) -> "AttentionMask":
-        return AttentionMask(is_causal=self.is_causal, explicit_mask=self.explicit_mask, segment_ids=segment_ids)
+        return AttentionMask(
+            is_causal=self.is_causal,
+            explicit_mask=self.explicit_mask,
+            segment_ids=segment_ids,
+            sliding_window=self.sliding_window,
+        )
+
+    def with_sliding_window(self, sliding_window: int | None) -> "AttentionMask":
+        """Return a copy of this mask with ``sliding_window`` applied."""
+        return AttentionMask(
+            is_causal=self.is_causal,
+            explicit_mask=self.explicit_mask,
+            segment_ids=self.segment_ids,
+            sliding_window=sliding_window,
+        )
 
     def __and__(self, other) -> "AttentionMask":
         is_causal = self.is_causal or other.is_causal
         explicit_mask = combine_masks_and(self.explicit_mask, other.explicit_mask)
         segment_ids = self._check_for_same_segment_ids(other)
+        if self.sliding_window is None:
+            sliding_window = other.sliding_window
+        elif other.sliding_window is None:
+            sliding_window = self.sliding_window
+        else:
+            sliding_window = min(self.sliding_window, other.sliding_window)
 
-        return AttentionMask(is_causal=is_causal, explicit_mask=explicit_mask, segment_ids=segment_ids)
+        return AttentionMask(
+            is_causal=is_causal,
+            explicit_mask=explicit_mask,
+            segment_ids=segment_ids,
+            sliding_window=sliding_window,
+        )
 
     def __or__(self, other) -> "AttentionMask":
         is_causal = self.is_causal and other.is_causal
         explicit_mask = combine_masks_or(self.explicit_mask, other.explicit_mask)
         segment_ids = self._check_for_same_segment_ids(other)
-        return AttentionMask(is_causal=is_causal, explicit_mask=explicit_mask, segment_ids=segment_ids)
+        if self.sliding_window is None or other.sliding_window is None:
+            sliding_window = None
+        else:
+            sliding_window = max(self.sliding_window, other.sliding_window)
+        return AttentionMask(
+            is_causal=is_causal,
+            explicit_mask=explicit_mask,
+            segment_ids=segment_ids,
+            sliding_window=sliding_window,
+        )
 
     def _check_for_same_segment_ids(self, other):
         if self.segment_ids is not None and other.segment_ids is not None:
@@ -667,8 +873,7 @@ def materialize_mask(
     KPos: Axis,
     q_slice: Optional[haliax.dslice] = None,
     k_slice: Optional[haliax.dslice] = None,
-) -> NamedArray:
-    ...
+) -> NamedArray: ...
 
 
 @overload
@@ -678,8 +883,7 @@ def materialize_mask(
     KPos: Axis,
     q_slice: Optional[haliax.dslice] = None,
     k_slice: Optional[haliax.dslice] = None,
-) -> Optional[NamedArray]:
-    ...
+) -> Optional[NamedArray]: ...
 
 
 def materialize_mask(
@@ -730,6 +934,8 @@ def _try_tpu_splash_attention(
     attention_dtype: Optional[jnp.dtype] = None,
     precision: PrecisionLike = None,
     block_size: Optional[int] = None,
+    scaling_factor: float,
+    logits_soft_cap: float | None,
 ) -> Optional[NamedArray]:
     if dropout != 0.0:
         if force_flash:
@@ -759,6 +965,8 @@ def _try_tpu_splash_attention(
             attention_dtype=attention_dtype,
             precision=precision,
             block_size=block_size,
+            scaling_factor=scaling_factor,
+            logits_soft_cap=logits_soft_cap,
         )
     except ImportError as e:
         if "pallas" not in str(e):
@@ -795,6 +1003,8 @@ def _tpu_splash_attention(
     attention_dtype: Optional[jnp.dtype] = None,
     precision: PrecisionLike = None,
     block_size: Optional[int] = None,
+    scaling_factor: float,
+    logits_soft_cap: float | None = None,
 ) -> Optional[NamedArray]:
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel, splash_attention_mask
 
@@ -813,8 +1023,7 @@ def _tpu_splash_attention(
 
     q_class, k_class, v_class = _bin_and_group_axes_by_function(query, key, value, QPos, KPos, Key)
 
-    # pre-divide q_ by sqrt(d) to match the reference implementation
-    query = query / jnp.sqrt(query.resolve_axis(Key).size)
+    query = query * scaling_factor
 
     q_: jax.Array = _reshape_axes_for_bshd_bins(query, q_class, output_order=list("BHSD")).array
     k_ = _reshape_axes_for_bshd_bins(key, k_class, output_order=list("BHSD")).array
@@ -930,6 +1139,13 @@ def _tpu_splash_attention(
                 base_mask = splash_attention_mask.CausalMask(shape=(Sq, Sk))
             else:
                 base_mask = splash_attention_mask.FullMask(_shape=(Sq, Sk))
+            if mask.sliding_window is not None:
+                local_mask = splash_attention_mask.LocalMask(
+                    shape=(Sq, Sk),
+                    window_size=(mask.sliding_window - 1, None),
+                    offset=0,
+                )
+                base_mask = splash_attention_mask.LogicalAnd(base_mask, local_mask)
             # This is going to be a pain to support
             if mask.explicit_mask is not None:
                 raise NotImplementedError("Explicit masks are not yet supported for splash attention")
@@ -943,7 +1159,11 @@ def _tpu_splash_attention(
 
         # copied from MaxText
         splash_kernel = splash_attention_kernel.make_splash_mha(
-            mask=kernel_mask, head_shards=1, q_seq_shards=1, block_sizes=block_sizes
+            mask=kernel_mask,
+            head_shards=1,
+            q_seq_shards=1,
+            block_sizes=block_sizes,
+            attn_logits_soft_cap=logits_soft_cap,
         )
 
         q = q.astype(attention_dtype)
@@ -981,3 +1201,489 @@ def _tpu_splash_attention(
     attn_output = haliax.shard(attn_output)
 
     return attn_output
+
+
+@dataclass(frozen=True)
+class AttentionConfig:
+    """Configuration for the Attention module.
+
+    Args:
+        Embed: The embedding dimension axis
+        num_heads: Number of attention heads
+        num_kv_heads: Number of key/value heads (for grouped-query attention)
+        use_bias: Whether to use bias in the attention projections
+        upcast_attn: Whether to upcast attention to float32 for better numerical stability
+        attn_backend: Which attention backend to use
+        flash_attention_block_size: Block size for flash attention
+        rope: Configuration for rotary position embeddings
+        scaling_factor: Optional scaling factor for attention scores. If None, defaults to 1/sqrt(head_size)
+        qk_norm: Optional configuration for QK normalization. If None, no normalization is applied.
+    """
+
+    Embed: Axis
+
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int | None = None
+    use_bias: bool = False
+    use_output_bias: Optional[bool] = None  # If None, uses use_bias
+    upcast_attn: bool = False
+    attn_backend: Optional[AttentionBackend] = None
+    flash_attention_block_size: Optional[int] = None
+    rope: Optional[RotaryEmbeddingsConfig] = None
+    scaling_factor: Optional[float] = None
+    logits_soft_cap: Optional[float] = None
+    qk_norm: Optional[LayerNormConfigBase] = None
+    """Configuration for QK normalization. If None, no normalization is applied."""
+
+    def __post_init__(self):
+        assert self.num_heads % self.num_kv_heads == 0, (
+            f"num_heads={self.num_heads} not divisible by num_kv_heads={self.num_kv_heads}."
+        )
+
+    @property
+    def head_size(self) -> int:
+        if self.head_dim is not None:
+            return self.head_dim
+        return self.Embed.size // self.num_heads
+
+    @property
+    def q_heads_per_group(self) -> int:
+        return self.num_heads // self.num_kv_heads
+
+    @property
+    def KVHeads(self) -> Axis:
+        return Axis("kv_heads", self.num_kv_heads)
+
+    @property
+    def Heads(self) -> Axis:
+        return Axis("heads", self.num_heads)
+
+    @property
+    def HeadSize(self) -> Axis:
+        return Axis("head_size", self.head_size)
+
+    @property
+    def QHeadsPerGroup(self) -> Axis:
+        """Axis for query heads per group."""
+        return Axis("q_heads_per_group", self.q_heads_per_group)
+
+    @property
+    def use_flash_attention(self) -> bool:
+        """Whether to use flash attention based on the backend."""
+        if self.attn_backend is None:
+            return default_attention_type() != AttentionBackend.VANILLA
+        return self.attn_backend != AttentionBackend.VANILLA
+
+
+class Attention(eqx.Module):
+    """A multi-head attention layer that uses dot product attention.
+
+    This is a general-purpose attention layer that can be used in various transformer architectures.
+    It supports multi-head attention (MHA), multi-query attention (MQA), and grouped-query attention (GQA).
+    """
+
+    config: AttentionConfig = eqx.field(static=True)
+    q_proj: hnn.Linear
+    k_proj: hnn.Linear
+    v_proj: hnn.Linear
+    o_proj: hnn.Linear
+    q_norm: Optional[LayerNormBase] = None
+    k_norm: Optional[LayerNormBase] = None
+    rot_embs: Optional[RotaryEmbeddings] = eqx.field(default=None)
+
+    @staticmethod
+    def init(config: AttentionConfig, *, key) -> "Attention":
+        use_bias = config.use_bias
+        use_output_bias = config.use_output_bias if config.use_output_bias is not None else use_bias
+        k_q, k_k, k_v, k_o = jrandom.split(key, 4)
+        q_proj = hnn.Linear.init(
+            In=config.Embed,
+            Out=(config.KVHeads, config.QHeadsPerGroup, config.HeadSize),
+            key=k_q,
+            use_bias=use_bias,
+            out_first=True,
+        )
+        k_proj = hnn.Linear.init(
+            In=config.Embed, Out=(config.KVHeads, config.HeadSize), key=k_k, use_bias=use_bias, out_first=True
+        )
+        v_proj = hnn.Linear.init(
+            In=(config.Embed), Out=(config.KVHeads, config.HeadSize), key=k_v, use_bias=use_bias, out_first=True
+        )
+        o_proj = hnn.Linear.init(
+            In=(config.Heads, config.HeadSize), Out=config.Embed, key=k_o, use_bias=use_output_bias, out_first=True
+        )
+
+        q_norm = None
+        k_norm = None
+        if config.qk_norm is not None:
+            q_norm = config.qk_norm.build(config.HeadSize)
+            k_norm = config.qk_norm.build(config.HeadSize)
+
+        # Build rotary embeddings once during initialization if configured
+        rot_embs = config.rope.build(config.HeadSize) if config.rope is not None else None
+
+        return Attention(config, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, rot_embs)
+
+    @named_call
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
+        key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
+
+        # Project to query, key, value
+        q_proj = self.q_proj(x, key=key_q)
+        k_proj = self.k_proj(x, key=key_k)
+        v = self.v_proj(x, key=key_v)
+
+        # Apply QK normalization if enabled
+        if self.config.qk_norm is not None:
+            q = self.q_norm(q_proj)  # type: ignore[misc]
+            k = self.k_norm(k_proj)  # type: ignore[misc]
+        else:
+            q = q_proj
+            k = k_proj
+
+        # Reshape for attention
+        q = q.rearrange((..., "kv_heads", "q_heads_per_group", "position", "head_size"))
+        k = k.rearrange((..., "kv_heads", "position", "head_size"))
+        v = v.rearrange((..., "kv_heads", "position", "head_size"))
+
+        # Apply rotary position embeddings if configured
+        if self.rot_embs is not None:
+            if pos_ids is None:
+                pos_ids = hax.arange(x.resolve_axis("position"), dtype=jnp.int32)
+            q = self.rot_embs(q, pos_ids)
+            k = self.rot_embs(k, pos_ids)
+
+        # Rename position axis for attention
+        k = k.rename({"position": "key_position"})
+        v = v.rename({"position": "key_position"})
+
+        # Apply attention
+        attn_output = dot_product_attention(
+            "position",
+            "key_position",
+            "head_size",
+            q,
+            k,
+            v,
+            mask,
+            attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
+            attn_backend=self.config.attn_backend,
+            flash_block_size=self.config.flash_attention_block_size,
+            scaling_factor=self.config.scaling_factor,
+            logits_soft_cap=self.config.logits_soft_cap,
+            dropout=0.0,  # TODO: support dropout
+            inference=True,  # TODO: support training
+            prng=key,
+        )
+
+        # Flatten heads and apply output projection
+        attn_output = attn_output.flatten_axes(("kv_heads", "q_heads_per_group"), "heads")
+        attn_output = attn_output.astype(x.dtype)
+        attn_output = self.o_proj(attn_output, key=key_o)
+
+        return attn_output
+
+@dataclass(frozen=True)
+class MultiHeadLatentAttentionConfig:
+    """Configuration for MultiHeadLatentAttention adapted from DeepSeek-V3."""
+
+    Embed: Axis
+    num_heads: int
+    kv_lora_rank: int
+    q_lora_rank: int | None = None
+    qk_rope_head_dim: int = 64
+    qk_nope_head_dim: int = 128
+    v_head_dim: int = 128
+    use_bias: bool = False
+    upcast_attn: bool = False
+    attn_backend: Optional[AttentionBackend] = None
+    flash_attention_block_size: Optional[int] = None
+    rope: Optional[RotaryEmbeddingsConfig] = None
+    scaling_factor: Optional[float] = None
+    logits_soft_cap: Optional[float] = None
+
+    @property
+    def Heads(self) -> Axis:
+        return Axis("heads", self.num_heads)
+
+    @property
+    def QHeadSize(self) -> Axis:
+        return Axis("q_head_dim", self.qk_rope_head_dim + self.qk_nope_head_dim)
+
+    @property
+    def VHeadSize(self) -> Axis:
+        return Axis("v_head_dim", self.v_head_dim)
+
+    @property
+    def LatentSize(self) -> Axis:
+        return Axis("latent", self.kv_lora_rank)
+
+    @property
+    def QLoraSize(self) -> Axis:
+        return Axis("q_lora_rank", self.q_lora_rank)
+
+    @property
+    def KVCombinedSize(self) -> Axis:
+        return Axis("kv_combined", self.kv_lora_rank + self.qk_rope_head_dim)
+
+
+class MultiHeadLatentAttention(eqx.Module):
+    """Multi-head attention layer with latent projections inspired by DeepSeek-V3.
+    Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py
+    """
+
+    config: MultiHeadLatentAttentionConfig = eqx.field(static=True)
+    kv_a_proj: hnn.Linear
+    kv_a_norm: LayerNormBase
+    kv_b_proj: hnn.Linear
+    o_proj: hnn.Linear
+
+    q_proj: hnn.Linear = None
+    q_a_proj: Optional[hnn.Linear] = None
+    q_a_norm: Optional[LayerNormBase] = None
+    q_b_proj: Optional[hnn.Linear] = None
+
+    rot_embs: Optional[RotaryEmbeddings] = eqx.field(default=None)
+
+    @staticmethod
+    def init(config: MultiHeadLatentAttentionConfig, *, key) -> "MultiHeadLatentAttention":
+        use_bias = config.use_bias
+        keys = jrandom.split(key, 5)
+        if config.q_lora_rank is None:
+            q_proj = hnn.Linear.init(
+                In=config.Embed,
+                Out=(config.Heads, config.QHeadSize),
+                key=keys[0],
+                use_bias=False,
+                out_first=True,
+            )
+            q_a_proj = None
+            q_a_norm = None
+            q_b_proj = None
+        else:
+            q_a_proj = hnn.Linear.init(
+                In=config.Embed,
+                Out=config.QLoraSize,
+                key=keys[0],
+                use_bias=use_bias,
+                out_first=True,
+            )
+            q_a_norm = hnn.RmsNorm.init(Axis("q_lora_rank", config.q_lora_rank), use_bias=False)
+            q_b_proj = hnn.Linear.init(
+                In=config.QLoraSize,
+                Out=(config.Heads, config.QHeadSize),
+                key=keys[1],
+                use_bias=False,
+                out_first=True,
+            )
+            q_proj = None
+
+        kv_a_proj = hnn.Linear.init(
+            In=config.Embed,
+            Out=config.KVCombinedSize,
+            key=keys[2],
+            use_bias=use_bias,
+            out_first=True,
+        )
+        kv_a_norm = hnn.RmsNorm.init(Axis("latent", config.kv_lora_rank), use_bias=False)
+        kv_b_proj = hnn.Linear.init(
+            In=config.LatentSize,
+            Out=(
+                config.Heads,
+                Axis("kv_out", config.qk_nope_head_dim + config.v_head_dim),
+            ),
+            key=keys[3],
+            use_bias=False,
+            out_first=True,
+        )
+        o_proj = hnn.Linear.init(
+            In=(config.Heads, config.VHeadSize),
+            Out=config.Embed,
+            key=keys[4],
+            use_bias=use_bias,
+            out_first=True,
+        )
+        rot_embs = config.rope.build(Axis("q_head_dim", config.qk_rope_head_dim)) if config.rope is not None else None
+
+        return MultiHeadLatentAttention(
+            config,
+            kv_a_proj,
+            kv_a_norm,
+            kv_b_proj,
+            o_proj,
+            q_proj,
+            q_a_proj,
+            q_a_norm,
+            q_b_proj,
+            rot_embs,
+        )
+
+    @named_call
+    def __call__(
+        self,
+        x: NamedArray,
+        mask: Optional[NamedArray | AttentionMask],
+        *,
+        key=None,
+        pos_ids: NamedArray | None = None,
+    ) -> NamedArray:
+        k_q_a, k_q_b, k_kv_a, k_kv_b, k_o = maybe_rng_split(key, 5)
+
+        # Project to a shared latent space for K and V.
+        # For inference, this means you just need to cache the reduced size latent.
+        kv = self.kv_a_proj(x, key=k_kv_a)
+        compressed_kv = kv["kv_combined", : self.config.kv_lora_rank].rename({"kv_combined": "latent"})
+
+        # We can't do RoPE on K without materializing K, so we shave off a
+        # qk_rope_head_dim-sized chunk to materialize for RoPE.
+        k_pe = (
+            kv["kv_combined", self.config.kv_lora_rank :]
+            .rename({"kv_combined": "q_head_dim"})
+            .broadcast_axis(self.config.Heads)
+            .rearrange(("batch", "heads", "position", "q_head_dim"))
+        )
+        compressed_kv_norm = self.kv_a_norm(compressed_kv)
+        kv_out = self.kv_b_proj(compressed_kv_norm, key=k_kv_b)
+
+        # Split the matrix into K_nope and the full V.
+        k_nope = kv_out["kv_out", : self.config.qk_nope_head_dim].rename({"kv_out": "q_head_dim"})
+        v = kv_out["kv_out", self.config.qk_nope_head_dim :].rename({"kv_out": "v_head_dim"})
+
+        # Optional step of doing LoRA on Q (as done in DeepSeek).
+        if self.config.q_lora_rank is None:
+            q = self.q_proj(x, key=k_q_a)
+        else:
+            assert self.q_a_proj is not None and self.q_a_norm is not None and self.q_b_proj is not None, (
+                "q_lora_rank defined, but LoRA matrices are not."
+            )
+            q = self.q_a_proj(x, key=k_q_a)
+            q = self.q_a_norm(q)
+            q = self.q_b_proj(q, key=k_q_b)
+        q = q.rearrange((..., "heads", "position", "q_head_dim"))
+
+        # Prep for partial RoPE.
+        q_nope = q["q_head_dim", : self.config.qk_nope_head_dim]
+        q_pe = q["q_head_dim", self.config.qk_nope_head_dim :]
+
+        # Apply RoPE to the split-off portion and then merge back together.
+        if self.rot_embs is not None:
+            if pos_ids is None:
+                pos_ids = hax.arange(x.resolve_axis("position"), dtype=jnp.int32)
+            q_pe = self.rot_embs(q_pe, pos_ids)
+            k_pe = self.rot_embs(k_pe, pos_ids)
+
+        query_states = hax.concatenate("q_head_dim", (q_nope, q_pe))
+        key_states = hax.concatenate("q_head_dim", (k_nope, k_pe))
+
+        # Rename axes for attention inputs.
+        key_states = key_states.rename({"position": "key_position"})
+        v = v.rename({"position": "key_position"})
+        # Build the value tensor AFTER renaming position → key_position.
+        v_attn = v.rename({"v_head_dim": "q_head_dim"})
+
+        attn_output = dot_product_attention(
+            "position",
+            "key_position",
+            "q_head_dim",
+            query_states,
+            key_states,
+            v_attn,
+            mask,
+            attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
+            attn_backend=self.config.attn_backend,
+            flash_block_size=self.config.flash_attention_block_size,
+            scaling_factor=self.config.scaling_factor,
+            logits_soft_cap=self.config.logits_soft_cap,
+            dropout=0.0,
+            inference=True,
+            prng=key,
+        )
+
+        attn_output = attn_output.rename({"q_head_dim": "v_head_dim"}).astype(x.dtype)
+        assert self.o_proj is not None
+        attn_output = self.o_proj(attn_output, key=k_o)
+        return attn_output
+
+class AttentionWithSink(Attention):
+    """Attention module that includes a learned sink term per head.
+
+    The sink is added to the softmax denominator, reducing the attention mass
+    assigned to tokens and allowing some probability to fall into a separate
+    bucket. This can improve stability during generation.
+    """
+
+    sinks: NamedArray | None = None
+
+    @staticmethod
+    def init(config: AttentionConfig, *, key) -> "AttentionWithSink":
+        base = Attention.init(config, key=key)
+        sinks = hax.zeros((config.KVHeads, config.QHeadsPerGroup), dtype=jnp.float32)
+        return AttentionWithSink(
+            base.config,
+            base.q_proj,
+            base.k_proj,
+            base.v_proj,
+            base.o_proj,
+            base.q_norm,
+            base.k_norm,
+            base.rot_embs,
+            sinks,
+        )
+
+    @named_call
+    def __call__(
+        self, x: NamedArray, mask: Optional[NamedArray | AttentionMask], *, key=None, pos_ids: NamedArray | None = None
+    ) -> NamedArray:
+        key_q, key_k, key_v, key_o = maybe_rng_split(key, 4)
+
+        q_proj = self.q_proj(x, key=key_q)
+        k_proj = self.k_proj(x, key=key_k)
+        v = self.v_proj(x, key=key_v)
+
+        if self.config.qk_norm is not None:
+            q = self.q_norm(q_proj)  # type: ignore[misc]
+            k = self.k_norm(k_proj)  # type: ignore[misc]
+        else:
+            q = q_proj
+            k = k_proj
+
+        q = q.rearrange((..., "kv_heads", "q_heads_per_group", "position", "head_size"))
+        k = k.rearrange((..., "kv_heads", "position", "head_size"))
+        v = v.rearrange((..., "kv_heads", "position", "head_size"))
+
+        if self.rot_embs is not None:
+            if pos_ids is None:
+                pos_ids = hax.arange(x.resolve_axis("position"), dtype=jnp.int32)
+            q = self.rot_embs(q, pos_ids)
+            k = self.rot_embs(k, pos_ids)
+
+        k = k.rename({"position": "key_position"})
+        v = v.rename({"position": "key_position"})
+
+        attn_output = dot_product_attention_with_sink(
+            "position",
+            "key_position",
+            "head_size",
+            q,
+            k,
+            v,
+            self.sinks,
+            mask,
+            attention_dtype=jnp.float32 if self.config.upcast_attn else x.dtype,
+            attn_backend=self.config.attn_backend,
+            flash_block_size=self.config.flash_attention_block_size,
+            scaling_factor=self.config.scaling_factor,
+            logits_soft_cap=self.config.logits_soft_cap,
+            dropout=0.0,
+            inference=True,
+            prng=key,
+        )
+
+        attn_output = attn_output.flatten_axes(("kv_heads", "q_heads_per_group"), "heads")
+        attn_output = attn_output.astype(x.dtype)
+        attn_output = self.o_proj(attn_output, key=key_o)
+
+        return attn_output

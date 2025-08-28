@@ -9,7 +9,7 @@ from jax import random
 import haliax as hax
 import haliax.nn as hnn
 
-from levanter.models.attention import AttentionMask
+from levanter.layers.attention import AttentionMask
 from levanter.models.olmo import Olmo2Attention, Olmo2Config, Olmo2DecoderLayer, Olmo2LMHeadModel
 from levanter.utils.jax_utils import parameter_count
 from test_utils import skip_if_no_torch
@@ -181,7 +181,14 @@ def test_olmo2_decoder_layer_vs_hf(num_kv_heads):
         x_torch, attention_mask=mask_torch, position_ids=position_ids, position_embeddings=(cos, sin)
     )
 
-    chex.assert_trees_all_close(hf_out[0].detach().cpu().numpy(), out.array, rtol=1e-5, atol=1e-5)
+    # Handle the case where HF returns separate batch elements vs single tensor
+    if isinstance(hf_out, torch.Tensor):
+        hf_array = hf_out.detach().cpu().numpy()
+    else:
+        hf_stacked = torch.stack(hf_out)
+        hf_array = hf_stacked.detach().cpu().numpy()
+
+    chex.assert_trees_all_close(hf_array, out.array, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("use_flash", [True, False])
